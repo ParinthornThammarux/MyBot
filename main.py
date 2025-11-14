@@ -22,7 +22,7 @@ API_SECRET = (os.getenv("BITKUB_API_SECRET", "") or "").encode()
 SYMBOL = "XRP_THB"
 WINDOW = 80
 THRESH_Z = 1.6
-REFRESH_SEC = 10
+REFRESH_SEC = 15
 ORDER_NOTIONAL_THB = 100
 SLIPPAGE_BPS = 8
 DRY_RUN = True             # ← แหล่งกำหนดเดียว
@@ -41,8 +41,7 @@ RETRY_BASE_DELAY = 0.6  # seconds
 
 COMMON_HEADERS = {
     "Accept": "application/json",
-    "Content-Type": "application/json",
-    "User-Agent": "bitkub-meanrev-bot/1.1 (+local)"
+    "Content-Type": "application/json"
 }
 
 session = requests.Session()
