@@ -1,6 +1,6 @@
 # ============================================================
-#  Bitkub MR + RSI(5m) — THB_XRP (TA-Lib only + short logs)
-#  [v3 trades + 5m candle close signals + DRY_RUN + retries]
+#  Bitkub MR + RSI(5m) — THB_XRP (จาก trades ย้อนหลังเอง)
+#  [v3 trades + 5m candle close signals + DRY_RUN + short logs]
 # ============================================================
 
 import os, time, hmac, hashlib, json, requests, math, random
@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 from collections import deque
 import numpy as np
 import talib as ta
-
 
 load_dotenv()
 
@@ -28,27 +27,27 @@ SYMBOL = "XRP_THB"
 WINDOW = 80
 THRESH_Z = 1.6
 
-# RSI on 5-minute candles
+# RSI on 5-minute candles (จาก trades ย้อนหลัง)
 CANDLE_SEC = 300
 RSI_PERIOD = 14
-RSI_BUY_TH = 30.0
-RSI_SELL_TH = 70.0
+RSI_BUY_TH = 50.0
+RSI_SELL_TH = 60.0
 USE_RSI_CONFIRM = True     # ต้องมี RSI + z-score ยืนยันร่วม
 RSI_ONLY_MODE   = False    # ใช้ RSI เดี่ยว ๆ
 
 # Loop & Orders
 REFRESH_SEC = 5
 ORDER_NOTIONAL_THB = 100
-SLIPPAGE_BPS = 8
+SLIPPAGE_BPS = 8          # 8 bps = 0.08%
 DRY_RUN = True
 PRICE_ROUND = 2
 QTY_ROUND = 6
 MAX_SERIES_LEN = 5000
-TRADES_FETCH = 300
+TRADES_FETCH = 300        # ดึง trade ล่าสุดสูงสุดกี่รายการต่อรอบ
 TIME_SYNC_INTERVAL = 300
 
 # Logging / Networking
-SHORT_LOG = True           # ← “log แบบสั้น” (แนะนำเปิด)
+SHORT_LOG = True           # log แบบสั้น
 HEARTBEAT_SEC = 60         # พิมพ์สถานะย่อ ๆ ทุก N วินาที
 HTTP_TIMEOUT = 12
 RETRY_MAX = 4
@@ -90,11 +89,9 @@ def ts_hms() -> str:
     return now_server_dt().strftime("%Y-%m-%d %H:%M:%S")
 
 def log(msg: str):
-    # long/verbose log (ใช้เฉพาะ init/error/สำคัญ)
     print(f"[{ts_hms()}] {msg}")
 
 def slog(msg: str):
-    # short log — ใช้ประจำ
     if SHORT_LOG:
         print(f"[{ts_hms()}] {msg}")
 
@@ -119,8 +116,6 @@ def sync_server_time():
         local_time = int(time.time() * 1000)
         _server_offset_ms = server_time - local_time
         _last_sync_ts = time.time()
-        if not SHORT_LOG:
-            log(f"[SYNC] offset={_server_offset_ms} ms")
     except Exception as e:
         log(f"[SYNC ERROR] {e}")
 
@@ -183,6 +178,9 @@ def http_post(url, headers=None, data="{}", timeout=HTTP_TIMEOUT):
 # [5] PUBLIC/PRIVATE API
 # ------------------------------------------------------------
 def get_trades(sym: str, limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    ใช้ /api/v3/market/trades (non-secure) ดึง trade ล่าสุด
+    """
     url = f"{BASE_URL}/api/v3/market/trades"
     params = {"sym": sym, "lmt": limit}
     for i in range(RETRY_MAX):
@@ -206,7 +204,12 @@ def get_trades(sym: str, limit: int = 10) -> List[Dict[str, Any]]:
 def place_bid(sym: str, thb_amount: float, rate: float, dry_run: bool) -> Dict[str, Any]:
     method, path = "POST", "/api/v3/market/place-bid"
     ts = ts_ms_str()
-    payload = {"sym": sym, "amt": float(int(thb_amount)), "rat": float(round(rate, PRICE_ROUND)), "typ": "limit"}
+    payload = {
+        "sym": sym,
+        "amt": float(int(thb_amount)),
+        "rat": float(round(rate, PRICE_ROUND)),
+        "typ": "limit"
+    }
     body = json.dumps(payload, separators=(",", ":"))
     if dry_run:
         return {"dry_run": True, "endpoint": path, "payload": payload}
@@ -217,7 +220,12 @@ def place_bid(sym: str, thb_amount: float, rate: float, dry_run: bool) -> Dict[s
 def place_ask(sym: str, qty_coin: float, rate: float, dry_run: bool) -> Dict[str, Any]:
     method, path = "POST", "/api/v3/market/place-ask"
     ts = ts_ms_str()
-    payload = {"sym": sym, "amt": float(round(qty_coin, QTY_ROUND)), "rat": float(round(rate, PRICE_ROUND)), "typ": "limit"}
+    payload = {
+        "sym": sym,
+        "amt": float(round(qty_coin, QTY_ROUND)),
+        "rat": float(round(rate, PRICE_ROUND)),
+        "typ": "limit"
+    }
     body = json.dumps(payload, separators=(",", ":"))
     if dry_run:
         return {"dry_run": True, "endpoint": path, "payload": payload}
@@ -259,7 +267,7 @@ def get_available(asset: str) -> float:
     return 0.0
 
 # ------------------------------------------------------------
-# [6] STRATEGY UTILS — vwap_tail, zscore, RSI
+# [6] STRATEGY UTILS — vwap_tail, zscore, RSI, candle from trades
 # ------------------------------------------------------------
 def vwap_tail(trades: List[Dict[str, Any]], tail: int = 10) -> Optional[float]:
     if not trades:
@@ -310,9 +318,6 @@ def compute_rsi(closes: List[float], period: int) -> Optional[float]:
     val = out[-1]
     return None if (val != val) else float(val)  # NaN check
 
-# ------------------------------------------------------------
-# [7] 5-MIN CANDLE BUILDER
-# ------------------------------------------------------------
 def extract_trade_ts_ms(trade: Any) -> Optional[int]:
     if isinstance(trade, dict):
         for k in ("ts", "tsms", "timestamp", "t"):
@@ -333,13 +338,21 @@ def extract_trade_ts_ms(trade: Any) -> Optional[int]:
 def candle_bucket_start_ms(ts_ms: int, candle_sec: int = CANDLE_SEC) -> int:
     return (ts_ms // (candle_sec * 1000)) * (candle_sec * 1000)
 
-def build_5m_close_from_trades(trades: List[Dict[str, Any]],
-                               last_closed_bucket_ms: Optional[int],
-                               closes: deque) -> Tuple[Optional[int], Optional[float], bool]:
+def build_5m_candles_from_trades(
+    trades: List[Dict[str, Any]],
+    last_closed_bucket_ms: Optional[int],
+    closes_5m: deque,
+) -> Tuple[Optional[int], Optional[float], bool]:
+    """
+    สร้างแท่ง 5 นาทีจาก trade ทั้งก้อนในรอบนั้น
+    - รวบ trade ตาม bucket 5 นาที (ใช้ timestamp ของ trade)
+    - เอา trade สุดท้ายของแต่ละ bucket เป็น close
+    - เติมเข้า closes_5m เฉพาะ bucket ที่ > last_closed_bucket_ms เท่านั้น
+    """
     if not trades:
         return last_closed_bucket_ms, None, False
 
-    items = []
+    items: List[Tuple[int, float]] = []
     for t in trades:
         ts = extract_trade_ts_ms(t)
         if ts is None:
@@ -358,38 +371,36 @@ def build_5m_close_from_trades(trades: List[Dict[str, Any]],
         if px is None:
             continue
         items.append((ts, float(px)))
+
     if not items:
         return last_closed_bucket_ms, None, False
 
+    # sort ตามเวลา
     items.sort(key=lambda x: x[0])
 
-    now_ms = now_server_ms()
-    current_bucket = candle_bucket_start_ms(now_ms)
+    # map: bucket_start_ms -> last price ใน bucket นั้น
+    bucket_close: Dict[int, float] = {}
+    for ts, px in items:
+        b = candle_bucket_start_ms(ts)
+        bucket_close[b] = px  # last trade in this bucket overwrites previous
 
-    if last_closed_bucket_ms is None:
-        last_closed_bucket_ms = current_bucket - CANDLE_SEC * 1000
+    if not bucket_close:
+        return last_closed_bucket_ms, None, False
 
-    closed = False
     new_close = None
+    closed_any = False
 
-    if current_bucket > last_closed_bucket_ms:
-        target_bucket = last_closed_bucket_ms
-        bucket_end = target_bucket + CANDLE_SEC * 1000
-        last_px_in_bucket = None
-        for (ts, px) in items:
-            if target_bucket <= ts < bucket_end:
-                last_px_in_bucket = px
-        if last_px_in_bucket is not None:
-            closes.append(float(last_px_in_bucket))
-            new_close = float(last_px_in_bucket)
-            closed = True
-        while current_bucket > last_closed_bucket_ms:
-            last_closed_bucket_ms += CANDLE_SEC * 1000
+    for b in sorted(bucket_close.keys()):
+        if (last_closed_bucket_ms is None) or (b > last_closed_bucket_ms):
+            closes_5m.append(bucket_close[b])
+            last_closed_bucket_ms = b
+            new_close = bucket_close[b]
+            closed_any = True
 
-    return last_closed_bucket_ms, new_close, closed
+    return last_closed_bucket_ms, new_close, closed_any
 
 # ------------------------------------------------------------
-# [8] MAIN LOOP
+# [7] MAIN LOOP
 # ------------------------------------------------------------
 def run_loop():
     sync_server_time()
@@ -397,6 +408,7 @@ def run_loop():
     price_series: deque = deque(maxlen=MAX_SERIES_LEN)
     closes_5m:    deque = deque(maxlen=3000)
     last_closed_bucket_ms: Optional[int] = None
+    initialized_candles = False
 
     log(f"Bitkub MR+RSI — {SYMBOL} | DRY_RUN={DRY_RUN} | "
         f"RSI_PERIOD={RSI_PERIOD} TH({RSI_BUY_TH}/{RSI_SELL_TH}) | "
@@ -417,21 +429,30 @@ def run_loop():
             px = vwap_tail(trades, tail=10)
             if px is not None:
                 price_series.append(px)
-            z = compute_zscore(price_series, WINDOW) if px is not None else None
+            z = compute_zscore(list(price_series), WINDOW) if px is not None else None
 
-            # build 5m candle close & compute RSI only when a candle closes
-            last_closed_bucket_ms, new_close, candle_closed = build_5m_close_from_trades(
+            # สร้าง / อัปเดตแท่ง 5m จาก trades ย้อนหลัง
+            prev_bucket = last_closed_bucket_ms
+            last_closed_bucket_ms, new_close, candle_closed = build_5m_candles_from_trades(
                 trades, last_closed_bucket_ms, closes_5m
             )
 
-            # heartbeat (สถานะย่อ ๆ ทุก HEARTBEAT_SEC)
+            # heartbeat
             now = time.time()
             if now - _last_heartbeat >= HEARTBEAT_SEC:
                 _last_heartbeat = now
-                if SHORT_LOG:
-                    slog(f"[HB] px={fmt(px,4)} z={fmt(z,2)} n5m={len(closes_5m)}")
+                slog(f"[HB] px={fmt(px,4)} z={fmt(z,2)} n5m={len(closes_5m)}")
 
-            if candle_closed:
+            # รอบแรก: seed แท่งย้อนหลังเฉย ๆ ก่อน ยังไม่ต้องเทรด
+            if not initialized_candles:
+                if last_closed_bucket_ms is not None:
+                    initialized_candles = True
+                    slog(f"[INIT 5M] n5m={len(closes_5m)}")
+                time.sleep(REFRESH_SEC)
+                continue
+
+            # มีแท่งใหม่ปิด (bucket ใหม่ > bucket เดิม)
+            if candle_closed and last_closed_bucket_ms != prev_bucket:
                 rsi_val = compute_rsi(list(closes_5m), RSI_PERIOD)
                 bid_px = round(px * (1 - SLIPPAGE_BPS / 10000), PRICE_ROUND) if px else None
                 ask_px = round(px * (1 + SLIPPAGE_BPS / 10000), PRICE_ROUND) if px else None
@@ -462,6 +483,7 @@ def run_loop():
                              f"bid≈{fmt(bid_px,2)} THB≈{ORDER_NOTIONAL_THB} (~{fmt(qty_est,6)}) DRY={DRY_RUN}")
                     else:
                         slog(f"[SKIP BUY] THB {thb_avail:.2f}<{ORDER_NOTIONAL_THB}")
+
                 elif do_sell and ask_px is not None:
                     xrp_avail = get_available("XRP")
                     if xrp_avail > 0:
@@ -475,7 +497,6 @@ def run_loop():
                     else:
                         slog(f"[SKIP SELL] XRP {xrp_avail:.6f}")
                 else:
-                    # short summary only at candle close
                     slog(f"[CLOSE] close={fmt(new_close,4)} RSI={fmt(rsi_val,2)} "
                          f"z={fmt(z,2)} n5m={len(closes_5m)}")
 
@@ -487,7 +508,7 @@ def run_loop():
         time.sleep(REFRESH_SEC)
 
 # ------------------------------------------------------------
-# [9] ENTRY
+# [8] ENTRY
 # ------------------------------------------------------------
 if __name__ == "__main__":
     run_loop()

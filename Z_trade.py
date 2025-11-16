@@ -20,16 +20,21 @@ API_KEY  = os.getenv("BITKUB_API_KEY", "")
 API_SECRET = (os.getenv("BITKUB_API_SECRET", "") or "").encode()
 
 SYMBOL = "XRP_THB"
-WINDOW = 80
-THRESH_Z = 1.6
-REFRESH_SEC = 15
+
+WINDOW = 30
+REFRESH_SEC = 60
+TRADES_FETCH = max(200, WINDOW + 20)
+
+THRESH_Z = 2.0
 ORDER_NOTIONAL_THB = 100
-SLIPPAGE_BPS = 8
-DRY_RUN = True             # ← แหล่งกำหนดเดียว
+SLIPPAGE_BPS = 6 #set for order match
+
+DRY_RUN = True #True for test
+
 PRICE_ROUND = 2
 QTY_ROUND = 6
 MAX_SERIES_LEN = 5000
-TRADES_FETCH = max(200, WINDOW + 5)
+
 TIME_SYNC_INTERVAL = 300
 
 # Debug/Networking
