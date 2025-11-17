@@ -25,17 +25,19 @@ WINDOW = 30
 REFRESH_SEC = 60
 TRADES_FETCH = max(200, WINDOW + 20)
 
-THRESH_Z = 2.0
-ORDER_NOTIONAL_THB = 100
-SLIPPAGE_BPS = 6 #set for order match
+THRESH_Z = 2.3
+ORDER_NOTIONAL_THB = 150
+SLIPPAGE_BPS = 4  # set for order match
 
-DRY_RUN = True #True for test
+DRY_RUN = True  # True for test
 
 PRICE_ROUND = 2
 QTY_ROUND = 6
 MAX_SERIES_LEN = 5000
 
 TIME_SYNC_INTERVAL = 300
+
+COOLDOWN_SEC = 300  # วินาทีคูลดาวน์หลังเทรด (เช่น 300 = 5 นาที)
 
 # Debug/Networking
 DEBUG_SAMPLE_TRADE = True
@@ -305,14 +307,18 @@ def compute_zscore(series: List[float], window: int) -> Optional[float]:
     return (series[-1] - mu) / sig
 
 # ------------------------------------------------------------
-# [7] MAIN LOOP
+# [7] MAIN LOOP (with COOLDOWN)
 # ------------------------------------------------------------
 def run_loop():
     sync_server_time()
     price_series: deque = deque(maxlen=MAX_SERIES_LEN)
 
+    # เวลาเทรดล่าสุด (epoch seconds) เริ่มต้นให้เป็น 0
+    last_trade_ts = 0.0
+
     log(f"Bitkub Mean Reversion Bot — {SYMBOL}")
     log(f"WINDOW={WINDOW} THRESH_Z={THRESH_Z} DRY_RUN={DRY_RUN}")
+    log(f"COOLDOWN_SEC={COOLDOWN_SEC}")
 
     while True:
         try:
@@ -341,26 +347,42 @@ def run_loop():
             bid_px = round(px * (1 - SLIPPAGE_BPS / 10000), PRICE_ROUND)
             ask_px = round(px * (1 + SLIPPAGE_BPS / 10000), PRICE_ROUND)
 
+            # --------- COOLDOWN CHECK ----------
+            now_ts = time.time()
+            in_cooldown = (now_ts - last_trade_ts) < COOLDOWN_SEC if last_trade_ts > 0 else False
+            cooldown_left = COOLDOWN_SEC - (now_ts - last_trade_ts) if in_cooldown else 0
+            # -----------------------------------
+
             if z <= -THRESH_Z:
-                thb_avail = get_available("THB")
-                if thb_avail < ORDER_NOTIONAL_THB:
-                    log(f"[SKIP BUY] THB={thb_avail:.2f} < {ORDER_NOTIONAL_THB} | px={px:.4f} z={z:.2f}")
+                if in_cooldown:
+                    log(f"[COOLDOWN] skip BUY, remaining={cooldown_left:.1f}s | px={px:.4f} z={z:.2f}")
                 else:
-                    qty_est = ORDER_NOTIONAL_THB / bid_px
-                    resp = place_bid(SYMBOL, ORDER_NOTIONAL_THB, bid_px, dry_run=DRY_RUN)
-                    log(f"[BUY ] z={z:.2f} px={px:.4f} bid≈{bid_px} THB≈{ORDER_NOTIONAL_THB} (~{qty_est:.6f} XRP) -> {resp}")
+                    thb_avail = get_available("THB")
+                    if thb_avail < ORDER_NOTIONAL_THB:
+                        log(f"[SKIP BUY] THB={thb_avail:.2f} < {ORDER_NOTIONAL_THB} | px={px:.4f} z={z:.2f}")
+                    else:
+                        qty_est = ORDER_NOTIONAL_THB / bid_px
+                        resp = place_bid(SYMBOL, ORDER_NOTIONAL_THB, bid_px, dry_run=DRY_RUN)
+                        log(f"[BUY ] z={z:.2f} px={px:.4f} bid≈{bid_px} THB≈{ORDER_NOTIONAL_THB} (~{qty_est:.6f} XRP) -> {resp}")
+                        # ตั้งคูลดาวน์หลังจากยิงออเดอร์
+                        last_trade_ts = now_ts
 
             elif z >= THRESH_Z:
-                xrp_avail = get_available("XRP")
-                if xrp_avail <= 0:
-                    log(f"[SKIP SELL] XRP={xrp_avail:.6f} | px={px:.4f} z={z:.2f}")
+                if in_cooldown:
+                    log(f"[COOLDOWN] skip SELL, remaining={cooldown_left:.1f}s | px={px:.4f} z={z:.2f}")
                 else:
-                    sell_qty = round(xrp_avail * 0.5, QTY_ROUND)
-                    if sell_qty > 0:
-                        resp = place_ask(SYMBOL, sell_qty, ask_px, dry_run=DRY_RUN)
-                        log(f"[SELL] z={z:.2f} px={px:.4f} ask≈{ask_px} qty≈{sell_qty:.6f} -> {resp}")
+                    xrp_avail = get_available("XRP")
+                    if xrp_avail <= 0:
+                        log(f"[SKIP SELL] XRP={xrp_avail:.6f} | px={px:.4f} z={z:.2f}")
                     else:
-                        log("[SKIP SELL] qty too small after rounding")
+                        sell_qty = round(xrp_avail * 0.5, QTY_ROUND)
+                        if sell_qty > 0:
+                            resp = place_ask(SYMBOL, sell_qty, ask_px, dry_run=DRY_RUN)
+                            log(f"[SELL] z={z:.2f} px={px:.4f} ask≈{ask_px} qty≈{sell_qty:.6f} -> {resp}")
+                            # ตั้งคูลดาวน์หลังจากยิงออเดอร์
+                            last_trade_ts = now_ts
+                        else:
+                            log("[SKIP SELL] qty too small after rounding")
             else:
                 log(f"[HOLD] px={px:.4f} z={z:.2f} bid≈{bid_px} ask≈{ask_px}")
 
