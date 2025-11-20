@@ -3,10 +3,11 @@
 #
 # - Grid strategy (no Z-score)
 # - v3 trades + server-time logs + HTTP debug + retries
-# - normalized trades + stable VWAP
+# - normalized trades + stable VWAP (numpy)
 # - position tracking (avg cost + PnL) + JSON persistence
 # - colored logs
 # - generic BASE/QUOTE (รองรับทุกคู่ที่เป็น BASE_QUOTE)
+# - Grid ตามหลัก: เลเวลลด = BUY, เลเวลเพิ่ม = SELL (ทีละกริด)
 # ============================================================
 
 import os
@@ -15,16 +16,12 @@ import hmac
 import hashlib
 import json
 import requests
-import math
 import random
 import datetime
 
 from typing import Dict, Any, List, Optional
-from dotenv import load_dotenv
 
-from collections import deque  # ยังไม่ได้ใช้ แต่เผื่ออนาคต
-
-load_dotenv()
+import numpy as np
 
 # ------------------------------------------------------------
 # COLOR CONSTANTS (ANSI)
@@ -44,10 +41,7 @@ FG_WHITE   = "\033[37m"
 
 
 def color_for(msg: str) -> str:
-    """
-    เลือกสีตามประเภท log จาก prefix / keyword ในข้อความ
-    ปรับ mapping ตรงนี้ได้ตามชอบ
-    """
+    """เลือกสีตามประเภท log จาก prefix / keyword ในข้อความ"""
     # ERROR / EXCEPTION
     if "ERROR" in msg or "EXC" in msg:
         return FG_RED + BOLD
@@ -100,13 +94,13 @@ BASE_URL = "https://api.bitkub.com"
 API_KEY = os.getenv("BITKUB_API_KEY", "")
 API_SECRET = (os.getenv("BITKUB_API_SECRET", "") or "").encode()
 
-SYMBOL = "XRP_THB"        # คู่ที่ใช้เทรด
+SYMBOL = "USDT_THB"        # คู่ที่ใช้เทรด
 
 REFRESH_SEC = 60           # วินาทีต่อการวนลูป 1 รอบ
 TRADES_FETCH = 200         # จำนวน trade ที่ดึงมาใช้คำนวณ VWAP
 
-ORDER_NOTIONAL_THB = 100   # มูลค่า THB ต่อไม้
-SLIPPAGE_BPS = 5           # slippage (bps) สำหรับตั้ง bid/ask ให้ match ง่ายขึ้น (0.05%)
+ORDER_NOTIONAL_THB = 100   # มูลค่า THB ต่อไม้ (ขนาดต่อกริด)
+SLIPPAGE_BPS = 5           # slippage (bps) (0.05%)
 FEE_RATE = 0.0025          # 0.25% ต่อข้าง (ซื้อ 0.25% + ขาย 0.25%)
 
 DRY_RUN = True             # True = ทดสอบ, False = ยิง order จริง
@@ -115,15 +109,15 @@ PRICE_ROUND = 2            # ทศนิยมราคาหน่วย THB
 QTY_ROUND = 6              # ทศนิยมจำนวนเหรียญ
 
 TIME_SYNC_INTERVAL = 300   # วินาทีในการ resync server time
-COOLDOWN_SEC = 90         # วินาที cooldown หลังเทรด (เช่น 180 = 3 นาที)
+COOLDOWN_SEC = 90          # วินาที cooldown หลังเทรด
 
 POS_FILE = "Cost_USDT.json"  # ไฟล์เก็บสถานะ position สำหรับ USDT
 
 # ==== GRID STRATEGY CONFIG ====
-GRID_CENTER_PRICE = 70.75   # จุดกึ่งกลางกริด (THB ต่อ 1 USDT) ปรับให้ใกล้ราคาปัจจุบัน
-GRID_STEP_PCT = 0.6        # ระยะห่างแต่ละชั้นกริดเป็น % เช่น 0.1% ต่อขั้น
-GRID_LEVELS_DOWN = 10      # จำนวนขั้นกริดด้านล่าง center (ซื้อ)
-GRID_LEVELS_UP = 10        # จำนวนขั้นกริดด้านบน center (ขาย)
+GRID_CENTER_PRICE = 32     # จุดกึ่งกลางกริด (THB ต่อ 1 USDT)
+GRID_STEP_PCT = 0.6        # ระยะห่างแต่ละชั้นกริดเป็น % เช่น 0.6% ต่อขั้น
+GRID_LEVELS_DOWN = 10      # จำนวนขั้นกริดด้านล่าง center
+GRID_LEVELS_UP = 10        # จำนวนขั้นกริดด้านบน center
 
 # Debug/Networking
 DEBUG_SAMPLE_TRADE = True
@@ -143,6 +137,10 @@ session = requests.Session()
 # แยก base / quote จาก SYMBOL เช่น USDT_THB -> base=USDT, quote=THB
 BASE_ASSET, QUOTE_ASSET = SYMBOL.split("_", 1)
 
+
+# ------------------------------------------------------------
+# [2] HTTP HELPERS
+# ------------------------------------------------------------
 
 def _backoff_sleep(i: int):
     # jittered exponential backoff
@@ -190,7 +188,7 @@ def http_post(url, headers=None, data="{}", timeout=HTTP_TIMEOUT):
 
 
 # ------------------------------------------------------------
-# [2] SERVER TIME SYNC + LOGGING
+# [3] SERVER TIME SYNC + LOGGING
 # ------------------------------------------------------------
 
 _server_offset_ms = 0
@@ -255,7 +253,7 @@ def ts_ms_str() -> str:
 
 
 # ------------------------------------------------------------
-# [3] AUTH UTILITIES
+# [4] AUTH UTILITIES
 # ------------------------------------------------------------
 
 def sign(timestamp_ms: str, method: str, request_path: str, body: str = "") -> str:
@@ -276,18 +274,13 @@ def build_headers(timestamp_ms: str, signature: Optional[str] = None) -> Dict[st
 
 
 # ------------------------------------------------------------
-# [4] PUBLIC API — robust v3 market/trades (normalized)
+# [5] PUBLIC API — TRADES (normalized)
 # ------------------------------------------------------------
 
 def get_trades(sym: str, limit: int = 10) -> List[Dict[str, Any]]:
     """
     ดึง trade จาก Bitkub แล้วแปลงให้อยู่รูปแบบเดียว:
     [{"ts": int, "rate": float, "amount": float}, ...] เรียงจากเก่า -> ใหม่
-    รองรับ 2 รูปแบบหลัก ๆ:
-      1) list/tuple: [ts, rate, amount, ...]
-      2) dict:
-         - {"ts","rat","amt", ...}   # รูปแบบ v3
-         - หรือ {"ts","rate","amount"}
     """
     url = f"{BASE_URL}/api/v3/market/trades"
     params = {"sym": sym, "lmt": limit}
@@ -324,11 +317,8 @@ def get_trades(sym: str, limit: int = 10) -> List[Dict[str, Any]]:
 
                     # รูปแบบ dict
                     elif isinstance(x, dict):
-                        # เคส v3 ปกติ: ts + rat + amt
                         if all(k in x for k in ("ts", "rat", "amt")):
                             ts_raw, rate_raw, amt_raw = x["ts"], x["rat"], x["amt"]
-
-                        # เผื่อบางตลาดใช้ชื่อเต็ม: rate + amount
                         elif all(k in x for k in ("ts", "rate", "amount")):
                             ts_raw, rate_raw, amt_raw = x["ts"], x["rate"], x["amount"]
                         else:
@@ -350,16 +340,13 @@ def get_trades(sym: str, limit: int = 10) -> List[Dict[str, Any]]:
                     })
 
                 except Exception:
-                    # ข้าม trade ที่ parse ไม่ได้
                     continue
 
             if not trades:
                 log(f"[TRADES WARN] no valid trades (len(raw)={len(raw)})")
                 return []
 
-            # ensure เรียงตามเวลา เก่า -> ใหม่
             trades.sort(key=lambda t: t["ts"])
-
             return trades
 
         except Exception as e:
@@ -367,6 +354,258 @@ def get_trades(sym: str, limit: int = 10) -> List[Dict[str, Any]]:
             _backoff_sleep(i)
 
     return []
+
+
+# ------------------------------------------------------------
+# [6] STRATEGY FUNCTIONS — VWAP (with numpy)
+# ------------------------------------------------------------
+
+def vwap_tail(trades: List[Dict[str, Any]], tail: int = 20) -> Optional[float]:
+    """
+    คำนวณ VWAP จาก trade ช่วงท้ายสุดของ list
+    ใช้ numpy ช่วยคำนวณให้เสถียรและเร็วขึ้น
+    trades: [{"ts","rate","amount"}, ...] เรียงเก่า -> ใหม่
+    """
+    if not trades:
+        return None
+
+    t = trades[-min(tail, len(trades)):]  # tail ช่วงท้าย
+
+    try:
+        rates = np.array([float(x["rate"]) for x in t], dtype=float)
+        amts = np.array([float(x["amount"]) for x in t], dtype=float)
+    except Exception:
+        # fallback เป็น loop ธรรมดา
+        total_notional = 0.0
+        total_qty = 0.0
+        for x in t:
+            try:
+                rate = float(x["rate"])
+                amt = float(x["amount"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if rate <= 0 or amt <= 0:
+                continue
+            total_notional += rate * amt
+            total_qty += amt
+        if total_qty > 0:
+            return total_notional / total_qty
+        last = t[-1]
+        try:
+            return float(last["rate"])
+        except Exception:
+            return None
+
+    mask = (rates > 0) & (amts > 0)
+    rates = rates[mask]
+    amts = amts[mask]
+
+    if amts.size == 0:
+        # fallback เป็น trade สุดท้าย
+        last = t[-1]
+        try:
+            return float(last["rate"])
+        except Exception:
+            return None
+
+    vwap = np.sum(rates * amts) / np.sum(amts)
+    return float(vwap)
+
+
+# ------------------------------------------------------------
+# [6.1] POSITION TRACKER + PERSISTENCE
+# ------------------------------------------------------------
+
+position_qty = 0.0         # ปริมาณ BASE_ASSET ที่ถืออยู่ตอนนี้ (เช่น USDT)
+position_cost_thb = 0.0    # ต้นทุนรวม (THB)
+realized_pnl_thb = 0.0     # กำไร/ขาดทุนที่ล็อกแล้ว (THB)
+
+# จำนวนกริด BUY ที่ยังไม่ถูกปิดด้วย SELL
+open_grid_buys = 0
+
+
+def load_position():
+    """โหลดสถานะ position จากไฟล์ JSON (ถ้ามี)"""
+    global position_qty, position_cost_thb, realized_pnl_thb, open_grid_buys
+    if not os.path.exists(POS_FILE):
+        print("[POS] position file not found. starting fresh.")
+        return
+    try:
+        with open(POS_FILE, "r") as f:
+            data = json.load(f)
+        position_qty = float(data.get("position_qty", 0.0))
+        position_cost_thb = float(data.get("position_cost_thb", 0.0))
+        realized_pnl_thb = float(data.get("realized_pnl_thb", 0.0))
+        open_grid_buys = int(data.get("open_grid_buys", 0))
+        print(
+            f"[POS] loaded: qty={position_qty} cost_sum={position_cost_thb} "
+            f"realized={realized_pnl_thb} open_grid_buys={open_grid_buys}"
+        )
+    except Exception as e:
+        print(f"[POS ERROR] failed to load position: {e}")
+
+
+def save_position():
+    """บันทึกสถานะ position ลงไฟล์ JSON"""
+    data = {
+        "position_qty": position_qty,
+        "position_cost_thb": position_cost_thb,
+        "realized_pnl_thb": realized_pnl_thb,
+        "open_grid_buys": open_grid_buys,
+    }
+    try:
+        with open(POS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        print("[POS] saved.")
+    except Exception as e:
+        print(f"[POS ERROR] failed to save: {e}")
+
+
+def pos_avg_cost() -> float:
+    """ต้นทุนเฉลี่ยต่อ 1 หน่วย BASE_ASSET"""
+    if position_qty <= 0:
+        return 0.0
+    return position_cost_thb / position_qty
+
+
+def on_fill_buy(qty: float, price: float, fee_rate: float = FEE_RATE):
+    """อัพเดตต้นทุนเมื่อ 'ซื้อ' BASE_ASSET"""
+    global position_qty, position_cost_thb
+
+    if qty <= 0 or price <= 0:
+        return
+
+    gross = qty * price
+    fee = gross * fee_rate
+    cost = gross + fee
+
+    position_qty += qty
+    position_cost_thb += cost
+
+    save_position()
+
+
+def on_fill_sell(qty: float, price: float, fee_rate: float = FEE_RATE):
+    """อัพเดตต้นทุน + realized PnL เมื่อ 'ขาย' BASE_ASSET"""
+    global position_qty, position_cost_thb, realized_pnl_thb
+
+    if qty <= 0 or price <= 0 or position_qty <= 0:
+        return
+
+    portion = min(qty / position_qty, 1.0)
+    cost_part = position_cost_thb * portion
+
+    gross = qty * price
+    fee = gross * fee_rate
+    proceed = gross - fee
+
+    pnl = proceed - cost_part
+    realized_pnl_thb += pnl
+
+    position_qty -= qty
+    position_cost_thb -= cost_part
+
+    if position_qty <= 0:
+        position_qty = 0.0
+        position_cost_thb = 0.0
+
+    save_position()
+
+
+def log_position(px: Optional[float] = None):
+    """log ต้นทุนเฉลี่ย, unrealized PnL, realized PnL"""
+    global open_grid_buys
+
+    if position_qty <= 0:
+        log(f"[POS] flat | realized={realized_pnl_thb:.2f} THB | open_grid_buys={open_grid_buys}")
+        return
+
+    avg_cost = pos_avg_cost()
+    unreal = (px - avg_cost) * position_qty if px is not None else 0.0
+
+    log(
+        "[POS] qty={qty:.6f} {asset} avg_cost={avg:.4f} THB | "
+        "cost_sum={cost:.2f} THB | unreal={unreal:.2f} THB | "
+        "realized={realized:.2f} THB | open_grid_buys={ogb}"
+        .format(
+            qty=position_qty,
+            asset=BASE_ASSET,
+            avg=avg_cost,
+            cost=position_cost_thb,
+            unreal=unreal,
+            realized=realized_pnl_thb,
+            ogb=open_grid_buys,
+        )
+    )
+
+
+# ------------------------------------------------------------
+# [6.2] GRID HELPERS
+# ------------------------------------------------------------
+
+last_grid_level = None  # state ของกริดในรอบก่อนหน้า
+
+
+def grid_step_thb() -> float:
+    """จำนวน THB ต่อ 1 ขั้นกริด จาก % ที่กำหนด"""
+    return GRID_CENTER_PRICE * GRID_STEP_PCT / 100.0
+
+
+def grid_level(price: float) -> int:
+    """
+    แปลงราคา -> หมายเลข level ของกริด
+    level = 0  : ใกล้ center
+    level < 0  : ต่ำกว่า center
+    level > 0  : สูงกว่า center
+    """
+    step = grid_step_thb()
+    if step <= 0:
+        return 0
+    diff = (price - GRID_CENTER_PRICE) / step
+    return int(round(diff))
+
+
+# ------------------------------------------------------------
+# [5.1] ACCOUNT — Balance
+# ------------------------------------------------------------
+
+def market_wallet() -> Dict[str, Any]:
+    method, path = "POST", "/api/v3/market/wallet"
+    ts = ts_ms_str()
+    body = "{}"
+    sg = sign(ts, method, path, body)
+    r = http_post(BASE_URL + path, headers=build_headers(ts, sg), data=body, timeout=HTTP_TIMEOUT)
+    return r.json()
+
+
+def market_balances() -> Dict[str, Any]:
+    method, path = "POST", "/api/v3/market/balances"
+    ts = ts_ms_str()
+    body = "{}"
+    sg = sign(ts, method, path, body)
+    r = http_post(BASE_URL + path, headers=build_headers(ts, sg), data=body, timeout=HTTP_TIMEOUT)
+    return r.json()
+
+
+def get_available(asset: str) -> float:
+    asset_key = asset.upper()
+    try:
+        res = market_balances()
+        if res.get("result") and res["result"].get(asset_key):
+            node = res["result"][asset_key]
+            if isinstance(node, dict) and "available" in node:
+                return float(node["available"])
+    except Exception as e:
+        log(f"[BAL ERR] balances {e}")
+
+    try:
+        res = market_wallet()
+        if res.get("result") and asset_key in res["result"]:
+            return float(res["result"][asset_key])
+    except Exception as e:
+        log(f"[BAL ERR] wallet {e}")
+
+    return 0.0
 
 
 # ------------------------------------------------------------
@@ -379,8 +618,7 @@ def place_bid(sym: str, thb_amount: float, rate: float, dry_run: bool) -> Dict[s
 
     payload = {
         "sym": sym,
-        # ถ้า Bitkub รองรับทศนิยมใน amount ฝั่ง quote ค่อยเปลี่ยน logic ตรงนี้
-        "amt": float(int(thb_amount)),
+        "amt": float(int(thb_amount)),           # quote ต้องเป็นจำนวนเต็ม
         "rat": float(round(rate, PRICE_ROUND)),
         "typ": "limit",
     }
@@ -415,260 +653,16 @@ def place_ask(sym: str, qty_coin: float, rate: float, dry_run: bool) -> Dict[str
 
 
 # ------------------------------------------------------------
-# [5.1] ACCOUNT — Balance
-# ------------------------------------------------------------
-
-def market_wallet() -> Dict[str, Any]:
-    method, path = "POST", "/api/v3/market/wallet"
-    ts = ts_ms_str()
-    body = "{}"
-    sg = sign(ts, method, path, body)
-    r = http_post(BASE_URL + path, headers=build_headers(ts, sg), data=body, timeout=HTTP_TIMEOUT)
-    return r.json()
-
-
-def market_balances() -> Dict[str, Any]:
-    method, path = "POST", "/api/v3/market/balances"
-    ts = ts_ms_str()
-    body = "{}"
-    sg = sign(ts, method, path, body)
-    r = http_post(BASE_URL + path, headers=build_headers(ts, sg), data=body, timeout=HTTP_TIMEOUT)
-    return r.json()
-
-
-def get_available(asset: str) -> float:
-    # balances → wallet (fallback)
-    asset_key = asset.upper()
-    try:
-        res = market_balances()
-        if res.get("result") and res["result"].get(asset_key):
-            node = res["result"][asset_key]
-            if isinstance(node, dict) and "available" in node:
-                return float(node["available"])
-    except Exception as e:
-        log(f"[BAL ERR] balances {e}")
-
-    try:
-        res = market_wallet()
-        if res.get("result") and asset_key in res["result"]:
-            return float(res["result"][asset_key])
-    except Exception as e:
-        log(f"[BAL ERR] wallet {e}")
-
-    return 0.0
-
-
-# ------------------------------------------------------------
-# [6] STRATEGY FUNCTIONS — VWAP
-# ------------------------------------------------------------
-
-def vwap_tail(trades: List[Dict[str, Any]], tail: int = 20) -> Optional[float]:
-    """
-    คำนวณ VWAP จาก trade ช่วงท้ายสุดของ list (ที่ normalize แล้ว)
-    trades ต้องอยู่ในรูป [{"ts","rate","amount"}, ...] เรียงเวลาเก่า->ใหม่
-    """
-    if not trades:
-        return None
-
-    t = trades[-min(tail, len(trades)):]
-    total_notional = 0.0
-    total_qty = 0.0
-
-    for x in t:
-        try:
-            rate = float(x["rate"])
-            amt = float(x["amount"])
-        except (KeyError, TypeError, ValueError):
-            continue
-
-        if rate <= 0 or amt <= 0:
-            continue
-
-        total_notional += rate * amt
-        total_qty += amt
-
-    if total_qty > 0:
-        return total_notional / total_qty
-
-    # ถ้าไม่มี trade ที่ใช้ได้เลย ให้ fallback เป็นราคาของ trade ล่าสุดจริง ๆ
-    last = t[-1]
-    try:
-        return float(last["rate"])
-    except Exception:
-        return None
-
-
-# ------------------------------------------------------------
-# [6.1] POSITION TRACKER + PERSISTENCE (avg cost + PnL)
-# ------------------------------------------------------------
-
-# ใช้ generic ชื่อ BASE_ASSET แทน XRP/USDT โดยตรง
-position_qty = 0.0         # ปริมาณ BASE_ASSET ที่ถืออยู่ตอนนี้ (เช่น USDT)
-position_cost_thb = 0.0    # ต้นทุนรวม (THB) ของ BASE_ASSET ที่ถืออยู่
-realized_pnl_thb = 0.0     # กำไร/ขาดทุนที่ "ล็อก" แล้ว (THB)
-
-
-def load_position():
-    """โหลดสถานะ position จากไฟล์ JSON (ถ้ามี)"""
-    global position_qty, position_cost_thb, realized_pnl_thb
-    if not os.path.exists(POS_FILE):
-        print("[POS] position file not found. starting fresh.")
-        return
-    try:
-        with open(POS_FILE, "r") as f:
-            data = json.load(f)
-        position_qty = float(data.get("position_qty", 0.0))
-        position_cost_thb = float(data.get("position_cost_thb", 0.0))
-        realized_pnl_thb = float(data.get("realized_pnl_thb", 0.0))
-        print(f"[POS] loaded: qty={position_qty} cost_sum={position_cost_thb} realized={realized_pnl_thb}")
-    except Exception as e:
-        print(f"[POS ERROR] failed to load position: {e}")
-
-
-def save_position():
-    """บันทึกสถานะ position ลงไฟล์ JSON"""
-    data = {
-        "position_qty": position_qty,
-        "position_cost_thb": position_cost_thb,
-        "realized_pnl_thb": realized_pnl_thb,
-    }
-    try:
-        with open(POS_FILE, "w") as f:
-            json.dump(data, f, indent=2)
-        print("[POS] saved.")
-    except Exception as e:
-        print(f"[POS ERROR] failed to save: {e}")
-
-
-def pos_avg_cost() -> float:
-    """ต้นทุนเฉลี่ยต่อ 1 หน่วย BASE_ASSET (THB/USDT, THB/XRP ฯลฯ)"""
-    if position_qty <= 0:
-        return 0.0
-    return position_cost_thb / position_qty
-
-
-def on_fill_buy(qty: float, price: float, fee_rate: float = FEE_RATE):
-    """
-    อัพเดตต้นทุนเมื่อ 'ซื้อ' BASE_ASSET (เช่น USDT)
-    qty   = ปริมาณ BASE_ASSET ที่ได้ (ประมาณจากคำสั่ง)
-    price = ราคาซื้อ (THB ต่อ 1 BASE_ASSET)
-    """
-    global position_qty, position_cost_thb
-
-    if qty <= 0 or price <= 0:
-        return
-
-    gross = qty * price           # มูลค่าที่ซื้อก่อน fee
-    fee = gross * fee_rate        # ค่าธรรมเนียมฝั่งซื้อ
-    cost = gross + fee            # ต้นทุนจริงรวม fee
-
-    position_qty += qty
-    position_cost_thb += cost
-
-    save_position()
-
-
-def on_fill_sell(qty: float, price: float, fee_rate: float = FEE_RATE):
-    """
-    อัพเดตต้นทุน + realized PnL เมื่อ 'ขาย' BASE_ASSET บางส่วนหรือทั้งหมด
-    ใช้ average cost method
-    """
-    global position_qty, position_cost_thb, realized_pnl_thb
-
-    if qty <= 0 or price <= 0 or position_qty <= 0:
-        return
-
-    # สัดส่วนของ position ที่ถูกขาย
-    portion = min(qty / position_qty, 1.0)
-    cost_part = position_cost_thb * portion  # ต้นทุนส่วนที่ถูกขาย
-
-    gross = qty * price
-    fee = gross * fee_rate
-    proceed = gross - fee                     # เงินสุทธิหลังหักค่าธรรมเนียมขาย
-
-    pnl = proceed - cost_part                 # กำไร/ขาดทุนของล็อตที่ขาย
-    realized_pnl_thb += pnl
-
-    # อัพเดตคงเหลือ
-    position_qty -= qty
-    position_cost_thb -= cost_part
-
-    # ถ้าขายหมดให้รีเซ็ตต้นทุน
-    if position_qty <= 0:
-        position_qty = 0.0
-        position_cost_thb = 0.0
-
-    save_position()
-
-
-def log_position(px: Optional[float] = None):
-    """
-    log ต้นทุนเฉลี่ย, unrealized PnL, realized PnL
-    px คือราคาตลาดปัจจุบัน (เช่น vwap_tail)
-    """
-    if position_qty <= 0:
-        log(f"[POS] flat | realized={realized_pnl_thb:.2f} THB")
-        return
-
-    avg_cost = pos_avg_cost()
-    if px is not None:
-        unreal = (px - avg_cost) * position_qty
-    else:
-        unreal = 0.0
-
-    log(
-        "[POS] qty={qty:.6f} {asset} avg_cost={avg:.4f} THB | "
-        "cost_sum={cost:.2f} THB | unreal={unreal:.2f} THB | realized={realized:.2f} THB"
-        .format(
-            qty=position_qty,
-            asset=BASE_ASSET,
-            avg=avg_cost,
-            cost=position_cost_thb,
-            unreal=unreal,
-            realized=realized_pnl_thb,
-        )
-    )
-
-
-# ------------------------------------------------------------
-# [6.2] GRID HELPERS
-# ------------------------------------------------------------
-
-last_grid_level = None  # state ของกริดในรอบก่อนหน้า
-
-
-def grid_step_thb() -> float:
-    """จำนวน THB ต่อ 1 ขั้นกริด จาก % ที่กำหนด"""
-    return GRID_CENTER_PRICE * GRID_STEP_PCT / 100.0
-
-
-def grid_level(price: float) -> int:
-    """
-    แปลงราคา -> หมายเลข level ของกริด
-    level = 0  : ใกล้ center
-    level < 0  : ต่ำกว่า center (ฝั่งซื้อ)
-    level > 0  : สูงกว่า center (ฝั่งขาย)
-    """
-    step = grid_step_thb()
-    if step <= 0:
-        return 0
-    diff = (price - GRID_CENTER_PRICE) / step
-    return int(round(diff))
-
-
-# ------------------------------------------------------------
 # [7] MAIN LOOP (GRID STRATEGY)
 # ------------------------------------------------------------
 
 def run_loop():
-    global last_grid_level
+    global last_grid_level, open_grid_buys
 
-    # โหลดสถานะ position จากไฟล์ (ถ้ามี)
     load_position()
-
     sync_server_time()
 
-    last_trade_ts = 0.0   # เวลาเทรดล่าสุด (epoch seconds)
+    last_trade_ts = 0.0   # เวลาเทรดล่าสุด
     debug_counter = 0
 
     step_thb = grid_step_thb()
@@ -708,12 +702,13 @@ def run_loop():
             # ========= GRID LOGIC =========
             lvl = grid_level(px)
 
-            # จำกัดให้ไม่เล่นกริดนอกช่วงที่กำหนด
+            # จำกัดกรอบกริด
             if lvl < -GRID_LEVELS_DOWN or lvl > GRID_LEVELS_UP:
                 log(
                     f"[HOLD] out-of-grid-range lvl={lvl} px={px:.4f} "
                     f"(center={GRID_CENTER_PRICE}, step≈{step_thb:.4f})"
                 )
+                last_grid_level = lvl
                 time.sleep(REFRESH_SEC)
                 continue
 
@@ -728,11 +723,11 @@ def run_loop():
                 time.sleep(REFRESH_SEC)
                 continue
 
-            moved_down = lvl < last_grid_level    # ราคาไหลลงผ่านชั้นใหม่
-            moved_up = lvl > last_grid_level      # ราคาไหลขึ้นผ่านชั้นใหม่
+            moved_down = lvl < last_grid_level   # เลเวลลด -> BUY
+            moved_up = lvl > last_grid_level     # เลเวลเพิ่ม -> SELL
 
-            # ===== BUY SIDE: ราคาไหลลง, อยู่ฝั่งล่าง center (lvl <= 0) =====
-            if moved_down and lvl <= 0:
+            # ===== BUY SIDE: เลเวลลด -> BUY 1 กริด =====
+            if moved_down:
                 if in_cooldown:
                     log(
                         f"[COOLDOWN] skip BUY lvl={lvl} (prev={last_grid_level}) "
@@ -746,22 +741,25 @@ def run_loop():
                             f"px={px:.4f} lvl={lvl}"
                         )
                     else:
-                        qty_est = ORDER_NOTIONAL_THB / bid_px  # ปริมาณ BASE_ASSET ที่คาดว่าจะได้
+                        qty_est = ORDER_NOTIONAL_THB / bid_px
                         resp = place_bid(SYMBOL, ORDER_NOTIONAL_THB, bid_px, dry_run=DRY_RUN)
 
                         if not DRY_RUN:
                             on_fill_buy(qty_est, bid_px)
+                            open_grid_buys += 1
+                            save_position()
+                        else:
+                            open_grid_buys += 1
 
                         log(
                             f"[BUY ] lvl={lvl} -> px={px:.4f} bid≈{bid_px} {QUOTE_ASSET}≈{ORDER_NOTIONAL_THB} "
-                            f"(~{qty_est:.6f} {BASE_ASSET}) -> {resp}"
+                            f"(~{qty_est:.6f} {BASE_ASSET}) -> {resp} | open_grid_buys={open_grid_buys}"
                         )
                         log_position(px)
-
                         last_trade_ts = now_ts
 
-            # ===== SELL SIDE: ราคาไหลขึ้น, อยู่ฝั่งบน center (lvl >= 0) =====
-            elif moved_up and lvl >= 0:
+            # ===== SELL SIDE: เลเวลเพิ่ม -> SELL 1 กริด =====
+            elif moved_up:
                 if in_cooldown:
                     log(
                         f"[COOLDOWN] skip SELL lvl={lvl} (prev={last_grid_level}) "
@@ -769,31 +767,48 @@ def run_loop():
                     )
                 else:
                     base_avail = get_available(BASE_ASSET)
-                    if base_avail <= 0:
+
+                    if open_grid_buys <= 0:
+                        log(
+                            f"[SKIP SELL] no open grid positions | {BASE_ASSET}={base_avail:.6f} "
+                            f"px={px:.4f} lvl={lvl}"
+                        )
+                    elif base_avail <= 0:
                         log(f"[SKIP SELL] {BASE_ASSET}={base_avail:.6f} | px={px:.4f} lvl={lvl}")
                     else:
-                        sell_qty = round(base_avail * 0.5, QTY_ROUND)  # ขายทีละครึ่งของที่มี
+                        target_qty = ORDER_NOTIONAL_THB / ask_px
+                        target_qty = round(target_qty, QTY_ROUND)
+
+                        sell_qty = min(target_qty, round(base_avail, QTY_ROUND))
+
                         if sell_qty > 0:
                             resp = place_ask(SYMBOL, sell_qty, ask_px, dry_run=DRY_RUN)
 
                             if not DRY_RUN:
                                 on_fill_sell(sell_qty, ask_px)
+                                open_grid_buys -= 1
+                                if open_grid_buys < 0:
+                                    open_grid_buys = 0
+                                save_position()
+                            else:
+                                open_grid_buys -= 1
+                                if open_grid_buys < 0:
+                                    open_grid_buys = 0
 
                             log(
                                 f"[SELL] lvl={lvl} -> px={px:.4f} ask≈{ask_px} "
-                                f"qty≈{sell_qty:.6f} {BASE_ASSET} -> {resp}"
+                                f"qty≈{sell_qty:.6f} {BASE_ASSET} -> {resp} | open_grid_buys={open_grid_buys}"
                             )
                             log_position(px)
-
                             last_trade_ts = now_ts
                         else:
                             log("[SKIP SELL] qty too small after rounding")
 
             else:
-                # ยังอยู่ใน level เดิม หรือขยับแต่ยังไม่เข้าเงื่อนไข buy/sell
+                # ยังอยู่ใน level เดิม
                 log(
                     f"[HOLD] px={px:.4f} lvl={lvl} prev_lvl={last_grid_level} "
-                    f"bid≈{bid_px} ask≈{ask_px}"
+                    f"bid≈{bid_px} ask≈{ask_px} | open_grid_buys={open_grid_buys}"
                 )
 
             # อัปเดต level ล่าสุดทุกครั้ง

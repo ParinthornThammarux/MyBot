@@ -93,7 +93,7 @@ WINDOW = 30                # จำนวนจุดข้อมูลที่
 REFRESH_SEC = 60           # วินาทีต่อการวนลูป 1 รอบ
 TRADES_FETCH = max(200, WINDOW + 20)
 
-THRESH_Z = 2.0
+THRESH_Z = 2.4
 ORDER_NOTIONAL_THB = 100
 SLIPPAGE_BPS = 6           # slippage (bps) สำหรับตั้ง bid/ask ให้ match ง่ายขึ้น
 
