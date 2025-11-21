@@ -99,7 +99,7 @@ SLIPPAGE_BPS = 6           # slippage (bps) สำหรับตั้ง bid/a
 
 FEE_RATE = 0.0025          # 0.25% ต่อข้าง (ซื้อ 0.25% + ขาย 0.25%)
 
-DRY_RUN = False            # True = ทดสอบ, False = ยิง order จริง
+DRY_RUN = True            # True = ทดสอบ, False = ยิง order จริง
 
 PRICE_ROUND = 2
 QTY_ROUND = 6

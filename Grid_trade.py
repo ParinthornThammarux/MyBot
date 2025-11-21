@@ -8,6 +8,7 @@
 # - colored logs
 # - generic BASE/QUOTE (รองรับทุกคู่ที่เป็น BASE_QUOTE)
 # - Grid ตามหลัก: เลเวลลด = BUY, เลเวลเพิ่ม = SELL (ทีละกริด)
+# - เวอร์ชันนี้ตั้งราคาออเดอร์ตาม "เส้นกริด" จริง ๆ
 # ============================================================
 
 import os
@@ -18,10 +19,14 @@ import json
 import requests
 import random
 import datetime
+import math
 
+from dotenv import load_dotenv
 from typing import Dict, Any, List, Optional
 
 import numpy as np
+
+load_dotenv()
 
 # ------------------------------------------------------------
 # COLOR CONSTANTS (ANSI)
@@ -100,7 +105,7 @@ REFRESH_SEC = 60           # วินาทีต่อการวนลูป
 TRADES_FETCH = 200         # จำนวน trade ที่ดึงมาใช้คำนวณ VWAP
 
 ORDER_NOTIONAL_THB = 100   # มูลค่า THB ต่อไม้ (ขนาดต่อกริด)
-SLIPPAGE_BPS = 5           # slippage (bps) (0.05%)
+SLIPPAGE_BPS = 0           # สำหรับเวอร์ชันนี้ ถ้าจะใช้ให้ไป offset จากราคาเส้นกริดเอง
 FEE_RATE = 0.0025          # 0.25% ต่อข้าง (ซื้อ 0.25% + ขาย 0.25%)
 
 DRY_RUN = True             # True = ทดสอบ, False = ยิง order จริง
@@ -108,16 +113,16 @@ DRY_RUN = True             # True = ทดสอบ, False = ยิง order จ
 PRICE_ROUND = 2            # ทศนิยมราคาหน่วย THB
 QTY_ROUND = 6              # ทศนิยมจำนวนเหรียญ
 
-TIME_SYNC_INTERVAL = 300   # วินาทีในการ resync server time
+TIME_SYNC_INTERVAL = 300   # (ไม่ได้ใช้ offset แล้ว แต่เก็บไว้เผื่อ)
 COOLDOWN_SEC = 90          # วินาที cooldown หลังเทรด
 
 POS_FILE = "Cost_USDT.json"  # ไฟล์เก็บสถานะ position สำหรับ USDT
 
 # ==== GRID STRATEGY CONFIG ====
 GRID_CENTER_PRICE = 32     # จุดกึ่งกลางกริด (THB ต่อ 1 USDT)
-GRID_STEP_PCT = 0.6        # ระยะห่างแต่ละชั้นกริดเป็น % เช่น 0.6% ต่อขั้น
-GRID_LEVELS_DOWN = 10      # จำนวนขั้นกริดด้านล่าง center
-GRID_LEVELS_UP = 10        # จำนวนขั้นกริดด้านบน center
+GRID_STEP_PCT = 0.7        # ระยะห่างแต่ละชั้นกริดเป็น % เช่น 1% ต่อขั้น
+GRID_LEVELS_DOWN = 10      # จำนวนขั้นกริดด้านล่าง center (เลเวลติดลบสุด)
+GRID_LEVELS_UP = 10        # จำนวนขั้นกริดด้านบน center (เลเวลบวกสุด)
 
 # Debug/Networking
 DEBUG_SAMPLE_TRADE = True
@@ -175,8 +180,13 @@ def http_post(url, headers=None, data="{}", timeout=HTTP_TIMEOUT):
         try:
             r = session.post(url, headers=h, data=data, timeout=timeout)
             if DEBUG_HTTP:
-                body_dbg = data if len(data) < 300 else data[:300] + "...(+)"
+                body_dbg = data if isinstance(data, str) and len(data) < 300 else str(data)[:300] + "...(+)"
                 print(f"[HTTP POST] {r.request.method} {r.url} -> {r.status_code} body={body_dbg}")
+                # log response text เผื่อดีบั๊ก error code จาก Bitkub
+                try:
+                    print(f"[HTTP POST RESP] {r.text}")
+                except Exception:
+                    pass
             r.raise_for_status()
             return r
         except Exception as e:
@@ -188,19 +198,16 @@ def http_post(url, headers=None, data="{}", timeout=HTTP_TIMEOUT):
 
 
 # ------------------------------------------------------------
-# [3] SERVER TIME SYNC + LOGGING
+# [3] TIME + LOGGING (ไม่ใช้ offset แล้ว)
 # ------------------------------------------------------------
 
-_server_offset_ms = 0
-_last_sync_ts = 0
-
-
 def now_server_ms() -> int:
-    return int(time.time() * 1000) + _server_offset_ms
+    # ใช้ local time แบบตรง ๆ เป็น millisecond (เทียบเท่า JS Date.now())
+    return int(time.time() * 1000)
 
 
 def now_server_dt() -> datetime.datetime:
-    return datetime.datetime.fromtimestamp(now_server_ms() / 1000)
+    return datetime.datetime.fromtimestamp(time.time())
 
 
 def ts_hms() -> str:
@@ -217,39 +224,11 @@ def log(msg: str):
     print(out)
 
 
-def sync_server_time():
-    global _server_offset_ms, _last_sync_ts
-    url = f"{BASE_URL}/api/v3/servertime"
-    try:
-        r = http_get(url, timeout=8)
-        data = r.json()
-        server_time = None
-
-        if isinstance(data, (int, float, str)):
-            server_time = int(data)
-        elif isinstance(data, dict):
-            server_time = int(data.get("result") or data.get("server_time"))
-
-        if server_time is None:
-            log(f"[SYNC ERROR] unexpected payload: {data}")
-            return
-
-        local_time = int(time.time() * 1000)
-        _server_offset_ms = server_time - local_time
-        _last_sync_ts = time.time()
-
-        readable_time = datetime.datetime.fromtimestamp(server_time / 1000)
-        log(f"[SYNC] offset={_server_offset_ms} ms, server={readable_time:%Y-%m-%d %H:%M:%S}")
-    except Exception as e:
-        log(f"[SYNC ERROR] {e}")
-
-
 def ts_ms_str() -> str:
-    global _last_sync_ts
-    now = time.time()
-    if now - _last_sync_ts > TIME_SYNC_INTERVAL:
-        sync_server_time()
-    return str(int(now * 1000) + _server_offset_ms)
+    """
+    Timestamp สำหรับ Bitkub v3 (ต้องการ ms เช่นเดียวกับ JS Date.now().toString())
+    """
+    return str(now_server_ms())
 
 
 # ------------------------------------------------------------
@@ -257,7 +236,13 @@ def ts_ms_str() -> str:
 # ------------------------------------------------------------
 
 def sign(timestamp_ms: str, method: str, request_path: str, body: str = "") -> str:
-    payload = (timestamp_ms + method.upper() + request_path + body).encode()
+    """
+    v3 sign = HMAC_SHA256( timestamp + method + requestPath + body )
+    - method: ใช้ตัวใหญ่ 'POST' / 'GET'
+    - request_path: เช่น '/api/market/wallet' หรือ '/api/v3/market/place-bid'
+    - body: string ที่ส่งจริง ("" หรือ JSON)
+    """
+    payload = (timestamp_ms + method.upper() + request_path + (body or "")).encode()
     return hmac.new(API_SECRET, payload, hashlib.sha256).hexdigest()
 
 
@@ -547,26 +532,33 @@ last_grid_level = None  # state ของกริดในรอบก่อน
 
 
 def grid_step_thb() -> float:
-    """จำนวน THB ต่อ 1 ขั้นกริด จาก % ที่กำหนด"""
+    """จำนวน THB ต่อ 1 ขั้นกริด จาก % ที่กำหนด (เทียบจาก center)"""
     return GRID_CENTER_PRICE * GRID_STEP_PCT / 100.0
 
 
-def grid_level(price: float) -> int:
+def grid_price(level: int) -> float:
     """
-    แปลงราคา -> หมายเลข level ของกริด
-    level = 0  : ใกล้ center
-    level < 0  : ต่ำกว่า center
-    level > 0  : สูงกว่า center
+    คืนราคา "เส้นกริด" สำหรับ level ที่กำหนด
+    level = 0  : เส้นที่ center
+    level = 1  : เส้นถัดไปด้านบน
+    level = -1 : เส้นถัดไปด้านล่าง
+    """
+    return GRID_CENTER_PRICE + grid_step_thb() * level
+
+
+def grid_level_from_price(price: float) -> float:
+    """
+    แปลงราคา -> index แบบ float ว่าอยู่ห่างจาก center กี่ step
+    ยังไม่ floor/round (ใช้ raw index)
     """
     step = grid_step_thb()
     if step <= 0:
-        return 0
-    diff = (price - GRID_CENTER_PRICE) / step
-    return int(round(diff))
+        return 0.0
+    return (price - GRID_CENTER_PRICE) / step
 
 
 # ------------------------------------------------------------
-# [5.1] ACCOUNT — Balance
+# [5.1] ACCOUNT — Wallet / Balances (PATH + BODY ตาม Docs)
 # ------------------------------------------------------------
 
 def market_wallet() -> Dict[str, Any]:
@@ -589,6 +581,7 @@ def market_balances() -> Dict[str, Any]:
 
 def get_available(asset: str) -> float:
     asset_key = asset.upper()
+    # พยายามใช้ balances ก่อน (มี reserved ด้วย)
     try:
         res = market_balances()
         if res.get("result") and res["result"].get(asset_key):
@@ -598,6 +591,7 @@ def get_available(asset: str) -> float:
     except Exception as e:
         log(f"[BAL ERR] balances {e}")
 
+    # fallback เป็น wallet (available only)
     try:
         res = market_wallet()
         if res.get("result") and asset_key in res["result"]:
@@ -660,7 +654,6 @@ def run_loop():
     global last_grid_level, open_grid_buys
 
     load_position()
-    sync_server_time()
 
     last_trade_ts = 0.0   # เวลาเทรดล่าสุด
     debug_counter = 0
@@ -671,6 +664,7 @@ def run_loop():
     log(f"LEVELS_DOWN={GRID_LEVELS_DOWN} LEVELS_UP={GRID_LEVELS_UP}")
     log(f"ORDER_NOTIONAL_THB={ORDER_NOTIONAL_THB} DRY_RUN={DRY_RUN}")
     log(f"COOLDOWN_SEC={COOLDOWN_SEC}")
+    log(f"Est. profit per grid (before slippage) ≈ {GRID_STEP_PCT - 2*FEE_RATE*100:.3f}%")
 
     while True:
         try:
@@ -690,9 +684,6 @@ def run_loop():
                 time.sleep(REFRESH_SEC)
                 continue
 
-            bid_px = round(px * (1 - SLIPPAGE_BPS / 10000), PRICE_ROUND)
-            ask_px = round(px * (1 + SLIPPAGE_BPS / 10000), PRICE_ROUND)
-
             last_trade = trades[-1]
             try:
                 log(f"[PRICE] px={px:.4f} | last_rate={last_trade['rate']:.4f} amt={last_trade['amount']}")
@@ -700,17 +691,32 @@ def run_loop():
                 log(f"[PRICE] px={px:.4f} | last_trade={last_trade}")
 
             # ========= GRID LOGIC =========
-            lvl = grid_level(px)
+            raw_idx = grid_level_from_price(px)   # index float
+            lvl = math.floor(raw_idx)             # cell ล่างของราคาปัจจุบัน
 
-            # จำกัดกรอบกริด
-            if lvl < -GRID_LEVELS_DOWN or lvl > GRID_LEVELS_UP:
+            # กำหนดเส้นกริดล่าง/บนสำหรับ cell นี้
+            buy_level = lvl
+            sell_level = lvl + 1
+
+            # ถ้าเลยกรอบกริดไปแล้ว -> ไม่เทรด
+            if buy_level < -GRID_LEVELS_DOWN or sell_level > GRID_LEVELS_UP:
                 log(
-                    f"[HOLD] out-of-grid-range lvl={lvl} px={px:.4f} "
-                    f"(center={GRID_CENTER_PRICE}, step≈{step_thb:.4f})"
+                    f"[HOLD] out-of-grid-range lvl={lvl} (buy_level={buy_level}, sell_level={sell_level}) "
+                    f"px={px:.4f} (center={GRID_CENTER_PRICE}, step≈{step_thb:.4f})"
                 )
                 last_grid_level = lvl
                 time.sleep(REFRESH_SEC)
                 continue
+
+            buy_px = round(grid_price(buy_level), PRICE_ROUND)   # ราคาเส้นล่าง
+            sell_px = round(grid_price(sell_level), PRICE_ROUND) # ราคาเส้นบน
+
+            # (ถ้าอยากให้มี slippage offset จากเส้นกริด เช่น buy ที่ต่ำกว่าเส้นเล็กน้อย/ขายที่สูงกว่าเล็กน้อย
+            #  สามารถปรับที่นี่ได้เอง เช่น:
+            #  if SLIPPAGE_BPS > 0:
+            #      buy_px = round(buy_px * (1 - SLIPPAGE_BPS/10000), PRICE_ROUND)
+            #      sell_px = round(sell_px * (1 + SLIPPAGE_BPS/10000), PRICE_ROUND)
+            # )
 
             now_ts = time.time()
             in_cooldown = (now_ts - last_trade_ts) < COOLDOWN_SEC if last_trade_ts > 0 else False
@@ -719,7 +725,10 @@ def run_loop():
             # รอบแรก: ตั้งค่า last_grid_level แล้วรอดูการเคลื่อนที่ก่อน
             if last_grid_level is None:
                 last_grid_level = lvl
-                log(f"[WARMUP] init grid level = {lvl} at px={px:.4f}")
+                log(
+                    f"[WARMUP] init grid level = {lvl} at px={px:.4f} "
+                    f"(buy_level={buy_level} @{buy_px}, sell_level={sell_level} @{sell_px})"
+                )
                 time.sleep(REFRESH_SEC)
                 continue
 
@@ -731,28 +740,29 @@ def run_loop():
                 if in_cooldown:
                     log(
                         f"[COOLDOWN] skip BUY lvl={lvl} (prev={last_grid_level}) "
-                        f"remaining={cooldown_left:.1f}s px={px:.4f}"
+                        f"remaining={cooldown_left:.1f}s px={px:.4f} buy_px={buy_px}"
                     )
                 else:
                     quote_avail = get_available(QUOTE_ASSET)
                     if quote_avail < ORDER_NOTIONAL_THB:
                         log(
                             f"[SKIP BUY] {QUOTE_ASSET}={quote_avail:.2f} < {ORDER_NOTIONAL_THB} | "
-                            f"px={px:.4f} lvl={lvl}"
+                            f"px={px:.4f} lvl={lvl} buy_lvl={buy_level} buy_px={buy_px}"
                         )
                     else:
-                        qty_est = ORDER_NOTIONAL_THB / bid_px
-                        resp = place_bid(SYMBOL, ORDER_NOTIONAL_THB, bid_px, dry_run=DRY_RUN)
+                        qty_est = ORDER_NOTIONAL_THB / buy_px
+                        resp = place_bid(SYMBOL, ORDER_NOTIONAL_THB, buy_px, dry_run=DRY_RUN)
 
                         if not DRY_RUN:
-                            on_fill_buy(qty_est, bid_px)
+                            on_fill_buy(qty_est, buy_px)
                             open_grid_buys += 1
                             save_position()
                         else:
                             open_grid_buys += 1
 
                         log(
-                            f"[BUY ] lvl={lvl} -> px={px:.4f} bid≈{bid_px} {QUOTE_ASSET}≈{ORDER_NOTIONAL_THB} "
+                            f"[BUY ] lvl={lvl} (prev={last_grid_level}) -> px={px:.4f} "
+                            f"buy_lvl={buy_level} buy_px={buy_px} {QUOTE_ASSET}≈{ORDER_NOTIONAL_THB} "
                             f"(~{qty_est:.6f} {BASE_ASSET}) -> {resp} | open_grid_buys={open_grid_buys}"
                         )
                         log_position(px)
@@ -763,7 +773,7 @@ def run_loop():
                 if in_cooldown:
                     log(
                         f"[COOLDOWN] skip SELL lvl={lvl} (prev={last_grid_level}) "
-                        f"remaining={cooldown_left:.1f}s px={px:.4f}"
+                        f"remaining={cooldown_left:.1f}s px={px:.4f} sell_px={sell_px}"
                     )
                 else:
                     base_avail = get_available(BASE_ASSET)
@@ -771,21 +781,21 @@ def run_loop():
                     if open_grid_buys <= 0:
                         log(
                             f"[SKIP SELL] no open grid positions | {BASE_ASSET}={base_avail:.6f} "
-                            f"px={px:.4f} lvl={lvl}"
+                            f"px={px:.4f} lvl={lvl} sell_lvl={sell_level}"
                         )
                     elif base_avail <= 0:
                         log(f"[SKIP SELL] {BASE_ASSET}={base_avail:.6f} | px={px:.4f} lvl={lvl}")
                     else:
-                        target_qty = ORDER_NOTIONAL_THB / ask_px
+                        target_qty = ORDER_NOTIONAL_THB / sell_px
                         target_qty = round(target_qty, QTY_ROUND)
 
                         sell_qty = min(target_qty, round(base_avail, QTY_ROUND))
 
                         if sell_qty > 0:
-                            resp = place_ask(SYMBOL, sell_qty, ask_px, dry_run=DRY_RUN)
+                            resp = place_ask(SYMBOL, sell_qty, sell_px, dry_run=DRY_RUN)
 
                             if not DRY_RUN:
-                                on_fill_sell(sell_qty, ask_px)
+                                on_fill_sell(sell_qty, sell_px)
                                 open_grid_buys -= 1
                                 if open_grid_buys < 0:
                                     open_grid_buys = 0
@@ -796,7 +806,8 @@ def run_loop():
                                     open_grid_buys = 0
 
                             log(
-                                f"[SELL] lvl={lvl} -> px={px:.4f} ask≈{ask_px} "
+                                f"[SELL] lvl={lvl} (prev={last_grid_level}) -> px={px:.4f} "
+                                f"sell_lvl={sell_level} sell_px={sell_px} "
                                 f"qty≈{sell_qty:.6f} {BASE_ASSET} -> {resp} | open_grid_buys={open_grid_buys}"
                             )
                             log_position(px)
@@ -808,14 +819,20 @@ def run_loop():
                 # ยังอยู่ใน level เดิม
                 log(
                     f"[HOLD] px={px:.4f} lvl={lvl} prev_lvl={last_grid_level} "
-                    f"bid≈{bid_px} ask≈{ask_px} | open_grid_buys={open_grid_buys}"
+                    f"buy_lvl={buy_level}@{buy_px} sell_lvl={sell_level}@{sell_px} "
+                    f"| open_grid_buys={open_grid_buys}"
                 )
 
             # อัปเดต level ล่าสุดทุกครั้ง
             last_grid_level = lvl
 
         except requests.HTTPError as e:
-            log(f"[HTTP ERROR] {getattr(e.response, 'text', str(e))}")
+            # แสดง body เผื่อเห็น error code ของ Bitkub เช่น {"error":6}
+            try:
+                body = e.response.text
+            except Exception:
+                body = str(e)
+            log(f"[HTTP ERROR] {body}")
         except Exception as e:
             log(f"[ERROR] {e}")
 
@@ -825,6 +842,5 @@ def run_loop():
 # ------------------------------------------------------------
 # [8] ENTRY POINT
 # ------------------------------------------------------------
-
 if __name__ == "__main__":
     run_loop()

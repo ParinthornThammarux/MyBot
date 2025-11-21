@@ -10,7 +10,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
 from collections import deque
 import numpy as np
-import talib as ta
+import pandas_ta as pta
 
 load_dotenv()
 
