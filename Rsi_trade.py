@@ -1,21 +1,30 @@
-# ============================================================
-#  Bitkub MR + RSI(5m) — THB_XRP (จาก trades ย้อนหลังเอง)
-#  [v3 trades + 5m candle close signals + DRY_RUN + short logs]
-# ============================================================
+import os, time, hmac, hashlib, json, requests, random, datetime
+from typing import Dict, Any, Optional
 
-import os, time, hmac, hashlib, json, requests, math, random
-import datetime
-from statistics import mean, pstdev
-from typing import Dict, Any, List, Optional, Tuple
 from dotenv import load_dotenv
-from collections import deque
-import numpy as np
-import pandas_ta as pta
+import pandas as pd
+import pandas_ta as ta
+from pathlib import Path
 
 load_dotenv()
 
 # ------------------------------------------------------------
-# [1] CONFIG
+# COLOR CONSTANTS (ANSI)
+# ------------------------------------------------------------
+RESET   = "\033[0m"
+BOLD    = "\033[1m"
+DIM     = "\033[2m"
+
+FG_RED     = "\033[31m"
+FG_GREEN   = "\033[32m"
+FG_YELLOW  = "\033[33m"
+FG_BLUE    = "\033[34m"
+FG_MAGENTA = "\033[35m"
+FG_CYAN    = "\033[36m"
+FG_WHITE   = "\033[37m"
+
+# ------------------------------------------------------------
+# [1] CONFIGURATION
 # ------------------------------------------------------------
 BASE_URL = "https://api.bitkub.com"
 API_KEY  = os.getenv("BITKUB_API_KEY", "")
@@ -23,87 +32,156 @@ API_SECRET = (os.getenv("BITKUB_API_SECRET", "") or "").encode()
 
 SYMBOL = "XRP_THB"
 
-# Mean-reversion (z-score)
-WINDOW = 80
-THRESH_Z = 1.6
+REFRESH_SEC = 60*5           # วินาทีต่อการวนลูป 1 รอบ
 
-# RSI on 5-minute candles (จาก trades ย้อนหลัง)
-CANDLE_SEC = 300
-RSI_PERIOD = 14
-RSI_BUY_TH = 50.0
-RSI_SELL_TH = 60.0
-USE_RSI_CONFIRM = True     # ต้องมี RSI + z-score ยืนยันร่วม
-RSI_ONLY_MODE   = False    # ใช้ RSI เดี่ยว ๆ
+ORDER_NOTIONAL_THB = 100   # ขนาด order ต่อครั้ง (THB)
+SLIPPAGE_BPS = 6           # slippage (bps) สำหรับตั้ง bid/ask ให้ match ง่ายขึ้น
 
-# Loop & Orders
-REFRESH_SEC = 5
-ORDER_NOTIONAL_THB = 100
-SLIPPAGE_BPS = 8          # 8 bps = 0.08%
-DRY_RUN = True
+FEE_RATE = 0.0025          # 0.25% ต่อข้าง (ซื้อ 0.25% + ขาย 0.25%)
+DRY_RUN = True             # True = ทดสอบ, False = ยิง order จริง
+
 PRICE_ROUND = 2
 QTY_ROUND = 6
-MAX_SERIES_LEN = 5000
-TRADES_FETCH = 300        # ดึง trade ล่าสุดสูงสุดกี่รายการต่อรอบ
-TIME_SYNC_INTERVAL = 300
 
-# Logging / Networking
-SHORT_LOG = True           # log แบบสั้น
-HEARTBEAT_SEC = 60         # พิมพ์สถานะย่อ ๆ ทุก N วินาที
+TIME_SYNC_INTERVAL = 300   # วินาทีในการ resync server time
+COOLDOWN_SEC = 300         # วินาที cooldown หลังเทรด (เช่น 300 = 5 นาที)
+
+POS_FILE = "Cost.json"     # ไฟล์เก็บสถานะ position
+
+# Debug/Networking
+DEBUG_HTTP = True
 HTTP_TIMEOUT = 12
 RETRY_MAX = 4
-RETRY_BASE_DELAY = 0.6
+RETRY_BASE_DELAY = 0.6     # seconds
 
 COMMON_HEADERS = {
     "Accept": "application/json",
-    "Content-Type": "application/json",
+    "Content-Type": "application/json"
 }
 
 session = requests.Session()
 
-# ---------- helper: safe formatter for logs ----------
-def fmt(x: Optional[float], nd: int = 4) -> str:
-    """Format number safely for logging; returns 'nan' if None/NaN/inf."""
-    try:
-        if x is None:
-            return "nan"
-        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
-            return "nan"
-        return f"{x:.{nd}f}"
-    except Exception:
-        return "nan"
-
 # ------------------------------------------------------------
-# [2] TIME & LOG
+# [2] LOGGING + TIME SYNC
 # ------------------------------------------------------------
 _server_offset_ms = 0
 _last_sync_ts = 0
-_last_heartbeat = 0
+
+
+def _backoff_sleep(i: int):
+    # jittered exponential backoff
+    delay = RETRY_BASE_DELAY * (2 ** i) + random.uniform(0, 0.2)
+    time.sleep(delay)
+
+
+def http_get(url, params=None, timeout=HTTP_TIMEOUT):
+    last_exc = None
+    for i in range(RETRY_MAX):
+        try:
+            r = session.get(url, params=params, headers=COMMON_HEADERS, timeout=timeout)
+            if DEBUG_HTTP:
+                print(f"[HTTP GET] {r.request.method} {r.url} -> {r.status_code}")
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_exc = e
+            if DEBUG_HTTP:
+                print(f"[HTTP GET ERROR#{i+1}] {url} params={params} err={e}")
+            _backoff_sleep(i)
+    raise last_exc
+
+
+def http_post(url, headers=None, data="{}", timeout=HTTP_TIMEOUT):
+    h = COMMON_HEADERS.copy()
+    if headers:
+        h.update(headers)
+    last_exc = None
+    for i in range(RETRY_MAX):
+        try:
+            r = session.post(url, headers=h, data=data, timeout=timeout)
+            if DEBUG_HTTP:
+                body_dbg = data if len(data) < 300 else data[:300] + "...(+)"
+                print(f"[HTTP POST] {r.request.method} {r.url} -> {r.status_code} body={body_dbg}")
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            last_exc = e
+            if DEBUG_HTTP:
+                print(f"[HTTP POST ERROR#{i+1}] {url} err={e}")
+            _backoff_sleep(i)
+    raise last_exc
+
 
 def now_server_ms() -> int:
     return int(time.time() * 1000) + _server_offset_ms
 
+
 def now_server_dt() -> datetime.datetime:
     return datetime.datetime.fromtimestamp(now_server_ms() / 1000)
+
 
 def ts_hms() -> str:
     return now_server_dt().strftime("%Y-%m-%d %H:%M:%S")
 
+
+def color_for(msg: str) -> str:
+    """
+    เลือกสีตามประเภท log จาก prefix / keyword ในข้อความ
+    """
+    # ERROR / EXCEPTION
+    if "ERROR" in msg or "EXC" in msg:
+        return FG_RED + BOLD
+
+    # HTTP DEBUG
+    if msg.startswith("[HTTP GET]") or msg.startswith("[HTTP POST]"):
+        return FG_CYAN + DIM
+    if "[HTTP GET ERROR" in msg or "[HTTP POST ERROR" in msg:
+        return FG_RED
+
+    # SYNC / TIME
+    if msg.startswith("[SYNC"):
+        return FG_CYAN
+
+    # POSITION
+    if msg.startswith("[POS]"):
+        return FG_MAGENTA
+
+    # PRICE / HOLD
+    if msg.startswith("[PRICE]"):
+        return FG_BLUE + BOLD
+    if msg.startswith("[HOLD]"):
+        return FG_CYAN
+
+    # BUY / SELL / COOLDOWN
+    if msg.startswith("[BUY "):
+        return FG_GREEN + BOLD
+    if msg.startswith("[SELL]"):
+        return FG_YELLOW + BOLD
+    if msg.startswith("[COOLDOWN]"):
+        return FG_YELLOW
+
+    # SKIP / WARN
+    if msg.startswith("[SKIP"):
+        return FG_YELLOW
+    if "WARN" in msg:
+        return FG_YELLOW + DIM
+
+    # DEFAULT
+    return FG_WHITE
+
+
 def log(msg: str):
-    print(f"[{ts_hms()}] {msg}")
+    ts = ts_hms()
+    color = color_for(msg)
+    out = f"{DIM}[{ts}]{RESET} {color}{msg}{RESET}"
+    print(out)
 
-def slog(msg: str):
-    if SHORT_LOG:
-        print(f"[{ts_hms()}] {msg}")
-
-def _backoff_sleep(i: int):
-    time.sleep(RETRY_BASE_DELAY * (2 ** i) + random.uniform(0, 0.2))
 
 def sync_server_time():
     global _server_offset_ms, _last_sync_ts
     url = f"{BASE_URL}/api/v3/servertime"
     try:
-        r = session.get(url, headers=COMMON_HEADERS, timeout=8)
-        r.raise_for_status()
+        r = http_get(url, timeout=8)
         data = r.json()
         server_time = None
         if isinstance(data, (int, float, str)):
@@ -116,8 +194,11 @@ def sync_server_time():
         local_time = int(time.time() * 1000)
         _server_offset_ms = server_time - local_time
         _last_sync_ts = time.time()
+        readable_time = datetime.datetime.fromtimestamp(server_time / 1000)
+        log(f"[SYNC] offset={_server_offset_ms} ms, server={readable_time:%Y-%m-%d %H:%M:%S}")
     except Exception as e:
         log(f"[SYNC ERROR] {e}")
+
 
 def ts_ms_str() -> str:
     global _last_sync_ts
@@ -126,12 +207,14 @@ def ts_ms_str() -> str:
         sync_server_time()
     return str(int(now * 1000) + _server_offset_ms)
 
+
 # ------------------------------------------------------------
-# [3] AUTH
+# [3] AUTH UTILITIES
 # ------------------------------------------------------------
 def sign(timestamp_ms: str, method: str, request_path: str, body: str = "") -> str:
     payload = (timestamp_ms + method.upper() + request_path + body).encode()
     return hmac.new(API_SECRET, payload, hashlib.sha256).hexdigest()
+
 
 def build_headers(timestamp_ms: str, signature: Optional[str] = None) -> Dict[str, str]:
     h = {
@@ -144,71 +227,18 @@ def build_headers(timestamp_ms: str, signature: Optional[str] = None) -> Dict[st
         h["X-BTK-SIGN"] = signature
     return h
 
-# ------------------------------------------------------------
-# [4] HTTP
-# ------------------------------------------------------------
-def http_get(url, params=None, timeout=HTTP_TIMEOUT):
-    last_exc = None
-    for i in range(RETRY_MAX):
-        try:
-            r = session.get(url, params=params, headers=COMMON_HEADERS, timeout=timeout)
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            last_exc = e
-            _backoff_sleep(i)
-    raise last_exc
-
-def http_post(url, headers=None, data="{}", timeout=HTTP_TIMEOUT):
-    h = COMMON_HEADERS.copy()
-    if headers:
-        h.update(headers)
-    last_exc = None
-    for i in range(RETRY_MAX):
-        try:
-            r = session.post(url, headers=h, data=data, timeout=timeout)
-            r.raise_for_status()
-            return r
-        except Exception as e:
-            last_exc = e
-            _backoff_sleep(i)
-    raise last_exc
 
 # ------------------------------------------------------------
-# [5] PUBLIC/PRIVATE API
+# [4] PRIVATE TRADE API
 # ------------------------------------------------------------
-def get_trades(sym: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    ใช้ /api/v3/market/trades (non-secure) ดึง trade ล่าสุด
-    """
-    url = f"{BASE_URL}/api/v3/market/trades"
-    params = {"sym": sym, "lmt": limit}
-    for i in range(RETRY_MAX):
-        try:
-            r = http_get(url, params=params, timeout=10)
-            data = r.json()
-            if isinstance(data, dict):
-                if data.get("error") not in (0, None):
-                    slog(f"[TRADES ERR] code={data.get('error')}")
-                    return []
-                res = data.get("result")
-                return res if isinstance(res, list) else []
-            elif isinstance(data, list):
-                return data
-            return []
-        except Exception as e:
-            slog(f"[TRADES EXC#{i+1}] {e}")
-            _backoff_sleep(i)
-    return []
-
 def place_bid(sym: str, thb_amount: float, rate: float, dry_run: bool) -> Dict[str, Any]:
     method, path = "POST", "/api/v3/market/place-bid"
     ts = ts_ms_str()
     payload = {
         "sym": sym,
-        "amt": float(int(thb_amount)),
+        "amt": float(int(thb_amount)),  # ถ้า Bitkub รองรับทศนิยม ค่อยเปลี่ยน logic ตรงนี้
         "rat": float(round(rate, PRICE_ROUND)),
-        "typ": "limit"
+        "typ": "limit",
     }
     body = json.dumps(payload, separators=(",", ":"))
     if dry_run:
@@ -216,6 +246,7 @@ def place_bid(sym: str, thb_amount: float, rate: float, dry_run: bool) -> Dict[s
     sg = sign(ts, method, path, body)
     r = http_post(BASE_URL + path, headers=build_headers(ts, sg), data=body, timeout=HTTP_TIMEOUT)
     return r.json()
+
 
 def place_ask(sym: str, qty_coin: float, rate: float, dry_run: bool) -> Dict[str, Any]:
     method, path = "POST", "/api/v3/market/place-ask"
@@ -224,7 +255,7 @@ def place_ask(sym: str, qty_coin: float, rate: float, dry_run: bool) -> Dict[str
         "sym": sym,
         "amt": float(round(qty_coin, QTY_ROUND)),
         "rat": float(round(rate, PRICE_ROUND)),
-        "typ": "limit"
+        "typ": "limit",
     }
     body = json.dumps(payload, separators=(",", ":"))
     if dry_run:
@@ -233,13 +264,6 @@ def place_ask(sym: str, qty_coin: float, rate: float, dry_run: bool) -> Dict[str
     r = http_post(BASE_URL + path, headers=build_headers(ts, sg), data=body, timeout=HTTP_TIMEOUT)
     return r.json()
 
-def market_wallet() -> Dict[str, Any]:
-    method, path = "POST", "/api/v3/market/wallet"
-    ts = ts_ms_str()
-    body = "{}"
-    sg = sign(ts, method, path, body)
-    r = http_post(BASE_URL + path, headers=build_headers(ts, sg), data=body, timeout=HTTP_TIMEOUT)
-    return r.json()
 
 def market_balances() -> Dict[str, Any]:
     method, path = "POST", "/api/v3/market/balances"
@@ -249,266 +273,376 @@ def market_balances() -> Dict[str, Any]:
     r = http_post(BASE_URL + path, headers=build_headers(ts, sg), data=body, timeout=HTTP_TIMEOUT)
     return r.json()
 
-def get_available(asset: str) -> float:
-    try:
-        res = market_balances()
-        if res.get("result") and res["result"].get(asset):
-            node = res["result"][asset]
-            if isinstance(node, dict) and "available" in node:
-                return float(node["available"])
-    except Exception as e:
-        slog(f"[BAL ERR] balances {e}")
-    try:
-        res = market_wallet()
-        if res.get("result") and asset in res["result"]:
-            return float(res["result"][asset])
-    except Exception as e:
-        slog(f"[BAL ERR] wallet {e}")
-    return 0.0
 
 # ------------------------------------------------------------
-# [6] STRATEGY UTILS — vwap_tail, zscore, RSI, candle from trades
+# [5] STRATEGY CONFIG - RSI + EMA Trend Filter
 # ------------------------------------------------------------
-def vwap_tail(trades: List[Dict[str, Any]], tail: int = 10) -> Optional[float]:
-    if not trades:
-        return None
-    t = trades[-min(tail, len(trades)):]
-    total = 0.0
-    qty = 0.0
-    for x in t:
-        rate = None
-        amt  = None
-        if isinstance(x, dict):
-            rate = x.get("rate", x.get("rat"))
-            amt  = x.get("amount", x.get("amt"))
-        elif isinstance(x, (list, tuple)) and len(x) >= 3:
-            try:
-                rate = float(x[1]); amt = float(x[2])
-            except Exception:
-                try:
-                    rate = float(x[2]); amt = float(x[1])
-                except Exception:
-                    pass
-        if rate is None or amt is None:
-            continue
-        rate = float(rate); amt = float(amt)
-        total += amt * rate
-        qty   += amt
-    if qty <= 0:
-        last = t[-1]
-        if isinstance(last, dict):
-            last_rate = last.get("rate", last.get("rat"))
-            return float(last_rate) if last_rate is not None else None
-        return None
-    return total / qty
 
-def compute_zscore(series: List[float], window: int) -> Optional[float]:
-    if len(series) < window or window < 2:
-        return None
-    sample = list(series)[-window:]
-    mu = mean(sample)
-    sig = pstdev(sample) or 1e-9
-    return (series[-1] - mu) / sig
+# Timeframe สำหรับ TradingView API ของ Bitkub
+# 4H = "240", 1H = "60"
+RESOLUTION = "60"        # "240" = 4H, "60" = 1H
+CANDLE_LIMIT = 300        # จำนวนแท่งเทียนย้อนหลังสำหรับคำนวณอินดิเคเตอร์
 
-def compute_rsi(closes: List[float], period: int) -> Optional[float]:
-    if len(closes) < period + 1:
-        return None
-    arr = np.asarray(closes, dtype=float)
-    out = ta.RSI(arr, timeperiod=period)
-    val = out[-1]
-    return None if (val != val) else float(val)  # NaN check
+RSI_LENGTH = 14
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
 
-def extract_trade_ts_ms(trade: Any) -> Optional[int]:
-    if isinstance(trade, dict):
-        for k in ("ts", "tsms", "timestamp", "t"):
-            if k in trade:
-                try:
-                    v = int(trade[k])
-                    return v if v > 10_000_000_000 else v * 1000
-                except Exception:
-                    pass
-    elif isinstance(trade, (list, tuple)) and len(trade) >= 1:
-        try:
-            v = int(trade[0])
-            return v if v > 10_000_000_000 else v * 1000
-        except Exception:
-            pass
-    return None
+EMA_FAST = 50             # EMA 50
+EMA_SLOW = 200            # EMA 200
 
-def candle_bucket_start_ms(ts_ms: int, candle_sec: int = CANDLE_SEC) -> int:
-    return (ts_ms // (candle_sec * 1000)) * (candle_sec * 1000)
+ENABLE_SHORT = False      # Bitkub ไม่มี short margin ตรงๆ -> ให้ False ไว้ก่อน
 
-def build_5m_candles_from_trades(
-    trades: List[Dict[str, Any]],
-    last_closed_bucket_ms: Optional[int],
-    closes_5m: deque,
-) -> Tuple[Optional[int], Optional[float], bool]:
+
+# ------------------------------------------------------------
+# [6] CANDLE FETCHING - TradingView API ของ Bitkub
+# ------------------------------------------------------------
+
+def fetch_candles(symbol: str, resolution: str, limit: int = 300) -> pd.DataFrame:
     """
-    สร้างแท่ง 5 นาทีจาก trade ทั้งก้อนในรอบนั้น
-    - รวบ trade ตาม bucket 5 นาที (ใช้ timestamp ของ trade)
-    - เอา trade สุดท้ายของแต่ละ bucket เป็น close
-    - เติมเข้า closes_5m เฉพาะ bucket ที่ > last_closed_bucket_ms เท่านั้น
+    ดึงแท่งเทียนจาก Bitkub TradingView API
+    return: DataFrame index เป็น datetime, column: [ts, open, high, low, close, volume]
     """
-    if not trades:
-        return last_closed_bucket_ms, None, False
+    now_sec = now_server_ms() // 1000
+    tf_sec = int(resolution) * 60
+    need_sec = (limit + 5) * tf_sec   # ขอเผื่อ 5 แท่ง
+    params = {
+        "symbol": symbol,
+        "resolution": resolution,
+        "from": now_sec - need_sec,
+        "to": now_sec
+    }
+    url = f"{BASE_URL}/tradingview/history"
 
-    items: List[Tuple[int, float]] = []
-    for t in trades:
-        ts = extract_trade_ts_ms(t)
-        if ts is None:
-            continue
-        px = None
-        if isinstance(t, dict):
-            px = t.get("rate", t.get("rat"))
-        elif isinstance(t, (list, tuple)) and len(t) >= 3:
-            try:
-                px = float(t[1])
-            except Exception:
-                try:
-                    px = float(t[2])
-                except Exception:
-                    pass
-        if px is None:
-            continue
-        items.append((ts, float(px)))
+    try:
+        r = http_get(url, params=params, timeout=HTTP_TIMEOUT)
+        data = r.json()
+    except Exception as e:
+        log(f"[ERROR] fetch_candles http error: {e}")
+        return pd.DataFrame()
 
-    if not items:
-        return last_closed_bucket_ms, None, False
+    if not isinstance(data, dict) or data.get("s") != "ok":
+        log(f"[ERROR] fetch_candles bad payload: {data}")
+        return pd.DataFrame()
 
-    # sort ตามเวลา
-    items.sort(key=lambda x: x[0])
+    t = data.get("t") or []
+    o = data.get("o") or []
+    h = data.get("h") or []
+    l = data.get("l") or []
+    c = data.get("c") or []
+    v = data.get("v") or []
 
-    # map: bucket_start_ms -> last price ใน bucket นั้น
-    bucket_close: Dict[int, float] = {}
-    for ts, px in items:
-        b = candle_bucket_start_ms(ts)
-        bucket_close[b] = px  # last trade in this bucket overwrites previous
+    if not t or not c:
+        log("[ERROR] fetch_candles no candles returned")
+        return pd.DataFrame()
 
-    if not bucket_close:
-        return last_closed_bucket_ms, None, False
+    df = pd.DataFrame({
+        "ts": t,
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "volume": v
+    })
 
-    new_close = None
-    closed_any = False
+    df["dt"] = pd.to_datetime(df["ts"], unit="s")
+    df.set_index("dt", inplace=True)
+    df = df.sort_index()
 
-    for b in sorted(bucket_close.keys()):
-        if (last_closed_bucket_ms is None) or (b > last_closed_bucket_ms):
-            closes_5m.append(bucket_close[b])
-            last_closed_bucket_ms = b
-            new_close = bucket_close[b]
-            closed_any = True
+    # ตัดให้เหลือ limit แท่งล่าสุด
+    if len(df) > limit:
+        df = df.iloc[-limit:]
 
-    return last_closed_bucket_ms, new_close, closed_any
+    return df
+
 
 # ------------------------------------------------------------
-# [7] MAIN LOOP
+# [7] INDICATORS + SIGNAL LOGIC
 # ------------------------------------------------------------
-def run_loop():
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    เติม EMA50, EMA200, RSI ลงใน DataFrame
+    """
+    if df.empty:
+        return df
+
+    close = df["close"].astype(float)
+
+    df["ema_fast"] = ta.ema(close, length=EMA_FAST)
+    df["ema_slow"] = ta.ema(close, length=EMA_SLOW)
+    df["rsi"] = ta.rsi(close, length=RSI_LENGTH)
+
+    return df
+
+
+def detect_signal(df: pd.DataFrame, in_long: bool, in_short: bool) -> Dict[str, Any]:
+    """
+    คืนค่า signal เป็น dict:
+      { "signal": "NONE|LONG_ENTRY|LONG_EXIT|SHORT_ENTRY|SHORT_EXIT",
+        "reason": str }
+    """
+    if df.empty or len(df) < EMA_SLOW + 5:
+        return {"signal": "NONE", "reason": "WARMUP"}
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    ema_fast_now = float(last["ema_fast"])
+    ema_slow_now = float(last["ema_slow"])
+    rsi_now = float(last["rsi"])
+    rsi_prev = float(prev["rsi"])
+
+    # ถ้ายังไม่มีค่า indicator (NaN)
+    if any(pd.isna([ema_fast_now, ema_slow_now, rsi_now, rsi_prev])):
+        return {"signal": "NONE", "reason": "INDICATOR_NAN"}
+
+    uptrend = ema_fast_now > ema_slow_now
+    downtrend = ema_fast_now < ema_slow_now
+
+    # ---------- LONG SIDE ----------
+    # กติกาเข้า Long:
+    # 1) EMA 50 > EMA 200  (ขาขึ้น)
+    # 2) RSI oversold ต่ำกว่า 30 แล้วตัดขึ้นกลับ (prev < 30, now >= 30)
+    long_entry_cond = (not in_long) and uptrend and (rsi_prev < RSI_OVERSOLD <= rsi_now)
+
+    # กติกาออก Long:
+    # - RSI จากเหนือ 70 ตัดลงกลับ (prev > 70, now <= 70)
+    #   หรือ trend เปลี่ยนเป็นลง (EMA50 < EMA200)
+    long_exit_cond = in_long and (
+        (rsi_prev > RSI_OVERBOUGHT >= rsi_now) or
+        downtrend
+    )
+
+    if long_entry_cond:
+        return {"signal": "LONG_ENTRY", "reason": "Uptrend + RSI cross up from oversold"}
+
+    if long_exit_cond:
+        return {"signal": "LONG_EXIT", "reason": "RSI cooled down or trend flipped down"}
+
+    # ---------- SHORT SIDE (ตัวอย่าง logic เฉย ๆ เผื่อใช้ภายหลัง) ----------
+    if ENABLE_SHORT:
+        short_entry_cond = (not in_short) and downtrend and (rsi_prev > RSI_OVERBOUGHT >= rsi_now)
+        short_exit_cond = in_short and (
+            (rsi_prev < RSI_OVERSOLD <= rsi_now) or
+            uptrend
+        )
+
+        if short_entry_cond:
+            return {"signal": "SHORT_ENTRY", "reason": "Downtrend + RSI cross down from overbought"}
+        if short_exit_cond:
+            return {"signal": "SHORT_EXIT", "reason": "RSI cooled down or trend flipped up"}
+
+    return {"signal": "NONE", "reason": "NO_CONDITION"}
+
+
+# ------------------------------------------------------------
+# [8] POSITION MANAGEMENT (ใช้ไฟล์ POS_FILE)
+# ------------------------------------------------------------
+
+def load_position() -> Dict[str, Any]:
+    p = Path(POS_FILE)
+    if not p.exists():
+        return {
+            "symbol": SYMBOL,
+            "side": "NONE",     # "LONG" หรือ "NONE"
+            "qty": 0.0,
+            "avg_price": 0.0,
+            "updated": None
+        }
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data
+    except Exception as e:
+        log(f"[POS ERROR] load_position: {e}")
+        return {
+            "symbol": SYMBOL,
+            "side": "NONE",
+            "qty": 0.0,
+            "avg_price": 0.0,
+            "updated": None
+        }
+
+
+def save_position(pos: Dict[str, Any]):
+    try:
+        pos["updated"] = ts_hms()
+        with open(POS_FILE, "w", encoding="utf-8") as f:
+            json.dump(pos, f, ensure_ascii=False, indent=2)
+        log(f"[POS] saved: {pos}")
+    except Exception as e:
+        log(f"[POS ERROR] save_position: {e}")
+
+
+def get_balances_safe() -> Dict[str, Any]:
+    """
+    คืน dict ของ balances["result"] หรือ {} ถ้า error
+    """
+    try:
+        data = market_balances()
+        if isinstance(data, dict) and data.get("error") == 0:
+            return data.get("result", {}) or {}
+        log(f"[ERROR] market_balances response: {data}")
+    except Exception as e:
+        log(f"[ERROR] market_balances exception: {e}")
+    return {}
+
+
+# ------------------------------------------------------------
+# [9] EXECUTION HELPERS (ซื้อ/ขาย)
+# ------------------------------------------------------------
+
+def open_long_market_like(last_price: float, dry_run: bool = DRY_RUN):
+    """
+    ซื้อด้วย THB ตาม ORDER_NOTIONAL_THB (หรือเท่าที่มี)
+    ใช้ limit order ที่ราคาขึ้นไปเล็กน้อยเพื่อให้ match ง่ายขึ้น
+    *NOTE: สมมติว่า order ถูก fill ทันที (สำหรับบอทจริงควรเช็คสถานะ order เพิ่มเติม)
+    """
+    balances = get_balances_safe()
+    thb_info = balances.get("THB") or {}
+    thb_available = float(thb_info.get("available", 0))
+
+    if thb_available < ORDER_NOTIONAL_THB * 0.9:
+        log(f"[SKIP] THB not enough: {thb_available:.2f} THB")
+        return None
+
+    amt_thb = min(thb_available, ORDER_NOTIONAL_THB)
+    rate = round(last_price * (1 + SLIPPAGE_BPS / 10000.0), PRICE_ROUND)
+
+    log(f"[BUY LONG] sym={SYMBOL}, amt_thb={amt_thb:.2f}, rate={rate}, dry_run={dry_run}")
+    resp = place_bid(SYMBOL, amt_thb, rate, dry_run=dry_run)
+
+    if dry_run:
+        # คำนวณ position สมมติ
+        qty_coin = (amt_thb * (1 - FEE_RATE)) / rate
+        pos = load_position()
+        new_qty = pos["qty"] + qty_coin
+        if new_qty <= 0:
+            avg_price = 0.0
+        else:
+            cost_old = pos["avg_price"] * pos["qty"]
+            cost_new = amt_thb
+            avg_price = (cost_old + cost_new) / new_qty
+
+        pos["side"] = "LONG"
+        pos["qty"] = new_qty
+        pos["avg_price"] = avg_price
+        save_position(pos)
+    else:
+        # production: ควรดึง order info / balance ใหม่ แล้วค่อยอัปเดต pos
+        pass
+
+    return resp
+
+
+def close_long_market_like(last_price: float, dry_run: bool = DRY_RUN):
+    """
+    ปิด LONG ทั้งหมด
+    ใช้ limit order ที่ราคาต่ำลงเล็กน้อยให้ match ง่ายขึ้น
+    """
+    pos = load_position()
+    if pos.get("side") != "LONG" or pos.get("qty", 0) <= 0:
+        log("[SKIP] no long position to close")
+        return None
+
+    qty = float(pos["qty"])
+    rate = round(last_price * (1 - SLIPPAGE_BPS / 10000.0), PRICE_ROUND)
+
+    log(f"[SELL] close LONG sym={SYMBOL}, qty={qty:.6f}, rate={rate}, dry_run={dry_run}")
+    resp = place_ask(SYMBOL, qty, rate, dry_run=dry_run)
+
+    if dry_run:
+        # สมมติปิดหมด
+        pos["side"] = "NONE"
+        pos["qty"] = 0.0
+        pos["avg_price"] = 0.0
+        save_position(pos)
+    else:
+        # production: ควรเช็คสถานะ order / balance ก่อนเคลียร์ pos
+        pass
+
+    return resp
+
+
+# ------------------------------------------------------------
+# [10] MAIN LOOP - RSI + EMA Trend Filter BOT
+# ------------------------------------------------------------
+
+def main_loop():
+    log(f"[INIT] Starting RSI+EMA bot on {SYMBOL}, TF={RESOLUTION}, DRY_RUN={DRY_RUN}")
     sync_server_time()
 
-    price_series: deque = deque(maxlen=MAX_SERIES_LEN)
-    closes_5m:    deque = deque(maxlen=3000)
-    last_closed_bucket_ms: Optional[int] = None
-    initialized_candles = False
-
-    log(f"Bitkub MR+RSI — {SYMBOL} | DRY_RUN={DRY_RUN} | "
-        f"RSI_PERIOD={RSI_PERIOD} TH({RSI_BUY_TH}/{RSI_SELL_TH}) | "
-        f"CONFIRM={USE_RSI_CONFIRM} RSI_ONLY={RSI_ONLY_MODE} | SHORT_LOG={SHORT_LOG}")
-
-    global _last_heartbeat
-    _last_heartbeat = time.time()
+    last_candle_ts = None
+    last_trade_time = 0.0
 
     while True:
         try:
-            trades = get_trades(SYMBOL, limit=TRADES_FETCH)
-            if not trades:
-                slog(f"[NO TRADES] retry {REFRESH_SEC}s")
+            df = fetch_candles(SYMBOL, RESOLUTION, limit=CANDLE_LIMIT)
+            if df.empty:
+                log("[WARN] NO CANDLES, skip this round")
                 time.sleep(REFRESH_SEC)
                 continue
 
-            # vwap tail → price_series (ใช้กับ z-score)
-            px = vwap_tail(trades, tail=10)
-            if px is not None:
-                price_series.append(px)
-            z = compute_zscore(list(price_series), WINDOW) if px is not None else None
+            latest_row = df.iloc[-1]
+            candle_ts = int(latest_row["ts"])
 
-            # สร้าง / อัปเดตแท่ง 5m จาก trades ย้อนหลัง
-            prev_bucket = last_closed_bucket_ms
-            last_closed_bucket_ms, new_close, candle_closed = build_5m_candles_from_trades(
-                trades, last_closed_bucket_ms, closes_5m
-            )
-
-            # heartbeat
-            now = time.time()
-            if now - _last_heartbeat >= HEARTBEAT_SEC:
-                _last_heartbeat = now
-                slog(f"[HB] px={fmt(px,4)} z={fmt(z,2)} n5m={len(closes_5m)}")
-
-            # รอบแรก: seed แท่งย้อนหลังเฉย ๆ ก่อน ยังไม่ต้องเทรด
-            if not initialized_candles:
-                if last_closed_bucket_ms is not None:
-                    initialized_candles = True
-                    slog(f"[INIT 5M] n5m={len(closes_5m)}")
+            # เช็คว่ามีแท่งใหม่หรือยัง
+            if last_candle_ts is not None and candle_ts == last_candle_ts:
+                log("[SKIP] No new candle yet")
                 time.sleep(REFRESH_SEC)
                 continue
 
-            # มีแท่งใหม่ปิด (bucket ใหม่ > bucket เดิม)
-            if candle_closed and last_closed_bucket_ms != prev_bucket:
-                rsi_val = compute_rsi(list(closes_5m), RSI_PERIOD)
-                bid_px = round(px * (1 - SLIPPAGE_BPS / 10000), PRICE_ROUND) if px else None
-                ask_px = round(px * (1 + SLIPPAGE_BPS / 10000), PRICE_ROUND) if px else None
+            last_candle_ts = candle_ts
 
-                do_buy = do_sell = False
-                if RSI_ONLY_MODE:
-                    if rsi_val is not None and rsi_val <= RSI_BUY_TH:
-                        do_buy = True
-                    if rsi_val is not None and rsi_val >= RSI_SELL_TH:
-                        do_sell = True
-                elif USE_RSI_CONFIRM:
-                    if (rsi_val is not None and rsi_val <= RSI_BUY_TH) and (z is not None and z <= -THRESH_Z):
-                        do_buy = True
-                    if (rsi_val is not None and rsi_val >= RSI_SELL_TH) and (z is not None and z >= THRESH_Z):
-                        do_sell = True
-                else:
-                    if z is not None and z <= -THRESH_Z:
-                        do_buy = True
-                    if z is not None and z >= THRESH_Z:
-                        do_sell = True
+            # เติม indicators
+            df = add_indicators(df)
+            last = df.iloc[-1]
+            price = float(last["close"])
+            ema_fast = float(last.get("ema_fast", float("nan")))
+            ema_slow = float(last.get("ema_slow", float("nan")))
+            rsi_val = float(last.get("rsi", float("nan")))
 
-                if do_buy and bid_px is not None:
-                    thb_avail = get_available("THB")
-                    if thb_avail >= ORDER_NOTIONAL_THB:
-                        qty_est = ORDER_NOTIONAL_THB / bid_px
-                        resp = place_bid(SYMBOL, ORDER_NOTIONAL_THB, bid_px, dry_run=DRY_RUN)
-                        slog(f"[BUY] px={fmt(px,4)} z={fmt(z,2)} RSI={fmt(rsi_val,2)} "
-                             f"bid≈{fmt(bid_px,2)} THB≈{ORDER_NOTIONAL_THB} (~{fmt(qty_est,6)}) DRY={DRY_RUN}")
-                    else:
-                        slog(f"[SKIP BUY] THB {thb_avail:.2f}<{ORDER_NOTIONAL_THB}")
+            log(f"[PRICE] close={price:.4f}, ema50={ema_fast:.4f}, ema200={ema_slow:.4f}, rsi={rsi_val:.2f}")
 
-                elif do_sell and ask_px is not None:
-                    xrp_avail = get_available("XRP")
-                    if xrp_avail > 0:
-                        sell_qty = round(xrp_avail * 0.5, QTY_ROUND)
-                        if sell_qty > 0:
-                            resp = place_ask(SYMBOL, sell_qty, ask_px, dry_run=DRY_RUN)
-                            slog(f"[SELL] px={fmt(px,4)} z={fmt(z,2)} RSI={fmt(rsi_val,2)} "
-                                 f"ask≈{fmt(ask_px,2)} qty≈{fmt(sell_qty,6)} DRY={DRY_RUN}")
-                        else:
-                            slog("[SKIP SELL] qty too small")
-                    else:
-                        slog(f"[SKIP SELL] XRP {xrp_avail:.6f}")
-                else:
-                    slog(f"[CLOSE] close={fmt(new_close,4)} RSI={fmt(rsi_val,2)} "
-                         f"z={fmt(z,2)} n5m={len(closes_5m)}")
+            pos = load_position()
+            in_long = pos.get("side") == "LONG" and pos.get("qty", 0) > 0
+            in_short = False  # ไม่มี short จริง
 
-        except requests.HTTPError as e:
-            log(f"[HTTP ERROR] {getattr(e.response, 'text', str(e))}")
+            sig = detect_signal(df, in_long=in_long, in_short=in_short)
+            signal = sig["signal"]
+            reason = sig["reason"]
+
+            # cooldown หลังเทรด
+            now_t = time.time()
+            if now_t - last_trade_time < COOLDOWN_SEC and signal != "NONE":
+                remain = int(COOLDOWN_SEC - (now_t - last_trade_time))
+                log(f"[COOLDOWN] {remain} sec remaining, skip signal={signal} ({reason})")
+                time.sleep(REFRESH_SEC)
+                continue
+
+            if signal == "LONG_ENTRY":
+                log(f"[SIGNAL] LONG_ENTRY ({reason})")
+                resp = open_long_market_like(price, dry_run=DRY_RUN)
+                last_trade_time = time.time()
+                log(f"[RESULT] LONG_ENTRY resp={resp}")
+
+            elif signal == "LONG_EXIT":
+                log(f"[SIGNAL] LONG_EXIT ({reason})")
+                resp = close_long_market_like(price, dry_run=DRY_RUN)
+                last_trade_time = time.time()
+                log(f"[RESULT] LONG_EXIT resp={resp}")
+
+            else:
+                log(f"[HOLD] signal={signal}, reason={reason}")
+
+        except KeyboardInterrupt:
+            log("[STOP] KeyboardInterrupt received, exiting.")
+            break
         except Exception as e:
-            log(f"[ERROR] {e}")
+            log(f"[ERROR] main_loop: {e}")
 
         time.sleep(REFRESH_SEC)
 
-# ------------------------------------------------------------
-# [8] ENTRY
-# ------------------------------------------------------------
+
 if __name__ == "__main__":
-    run_loop()
+    main_loop()

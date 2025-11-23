@@ -4,6 +4,7 @@
 #  + normalized trades + stable VWAP + better debug
 #  + position tracking (avg cost + PnL) + JSON persistence
 #  + colored logs
+#  + edge filter vs fee (compute_zscore_with_stats + edge_pct)
 # ============================================================
 
 import os, time, hmac, hashlib, json, requests, math, random
@@ -93,13 +94,15 @@ WINDOW = 30                # จำนวนจุดข้อมูลที่
 REFRESH_SEC = 60           # วินาทีต่อการวนลูป 1 รอบ
 TRADES_FETCH = max(200, WINDOW + 20)
 
-THRESH_Z = 2.4
+THRESH_Z = 2.8
 ORDER_NOTIONAL_THB = 100
 SLIPPAGE_BPS = 6           # slippage (bps) สำหรับตั้ง bid/ask ให้ match ง่ายขึ้น
 
 FEE_RATE = 0.0025          # 0.25% ต่อข้าง (ซื้อ 0.25% + ขาย 0.25%)
+FEE_ROUNDTRIP = 2 * FEE_RATE   # ~0.5% ไป-กลับ
+EDGE_BUFFER   = 0.003          # 0.3% เผื่อ slippage/noise (ปรับได้)
 
-DRY_RUN = True            # True = ทดสอบ, False = ยิง order จริง
+DRY_RUN = True             # True = ทดสอบ, False = ยิง order จริง
 
 PRICE_ROUND = 2
 QTY_ROUND = 6
@@ -109,7 +112,7 @@ TIME_SYNC_INTERVAL = 300   # วินาทีในการ resync server tim
 
 COOLDOWN_SEC = 300         # วินาที cooldown หลังเทรด (เช่น 300 = 5 นาที)
 
-POS_FILE = "Cost.json" # ไฟล์เก็บสถานะ position
+POS_FILE = "Cost.json"     # ไฟล์เก็บสถานะ position
 
 # Debug/Networking
 DEBUG_SAMPLE_TRADE = True
@@ -289,7 +292,6 @@ def get_trades(sym: str, limit: int = 10) -> List[Dict[str, Any]]:
                 log(f"[TRADES WARN] trades result is not a list: {type(raw)}")
                 return []
 
-
             trades: List[Dict[str, Any]] = []
 
             for x in raw:
@@ -346,7 +348,6 @@ def get_trades(sym: str, limit: int = 10) -> List[Dict[str, Any]]:
             _backoff_sleep(i)
 
     return []
-
 
 
 # ------------------------------------------------------------
@@ -467,12 +468,27 @@ def vwap_tail(trades: List[Dict[str, Any]], tail: int = 20) -> Optional[float]:
 
 
 def compute_zscore(series: List[float], window: int) -> Optional[float]:
+    """ฟังก์ชันเดิม (ยังเก็บไว้เผื่อใช้ที่อื่น)"""
     if len(series) < window or window < 2:
         return None
     sample = list(series)[-window:]
     mu = mean(sample)
     sig = pstdev(sample) or 1e-9
     return (series[-1] - mu) / sig
+
+
+def compute_zscore_with_stats(series: List[float], window: int):
+    """
+    คืนค่า (z, mean, std) สำหรับ window ล่าสุด
+    ใช้ให้เราคำนวณทั้ง Z-score และ %edge จาก mean ได้ในทีเดียว
+    """
+    if len(series) < window or window < 2:
+        return None, None, None
+    sample = list(series)[-window:]
+    mu = mean(sample)
+    sig = pstdev(sample) or 1e-9
+    z = (series[-1] - mu) / sig
+    return z, mu, sig
 
 
 # ------------------------------------------------------------
@@ -605,7 +621,7 @@ def log_position(px: Optional[float] = None):
 
 
 # ------------------------------------------------------------
-# [7] MAIN LOOP (with COOLDOWN + POSITION)
+# [7] MAIN LOOP (with COOLDOWN + POSITION + EDGE FILTER)
 # ------------------------------------------------------------
 def run_loop():
     # โหลดสถานะ position จากไฟล์ (ถ้ามี)
@@ -620,6 +636,7 @@ def run_loop():
     log(f"Bitkub Mean Reversion Bot — {SYMBOL}")
     log(f"WINDOW={WINDOW} THRESH_Z={THRESH_Z} DRY_RUN={DRY_RUN}")
     log(f"COOLDOWN_SEC={COOLDOWN_SEC}")
+    log(f"FEE_ROUNDTRIP={FEE_ROUNDTRIP*100:.3f}% EDGE_BUFFER={EDGE_BUFFER*100:.3f}%")
 
     while True:
         try:
@@ -641,11 +658,23 @@ def run_loop():
                 continue
 
             price_series.append(px)
-            z = compute_zscore(price_series, WINDOW)
-            if z is None:
+
+            # ใช้ zscore + mean + std พร้อมกัน
+            z, mu, sig = compute_zscore_with_stats(list(price_series), WINDOW)
+            if z is None or mu is None:
                 log(f"[WARMUP] collecting data... px={px:.4f} len={len(price_series)}/{WINDOW}")
                 time.sleep(REFRESH_SEC)
                 continue
+
+            # --- EDGE FILTER: เช็คว่าเบี่ยงจาก mean กี่ % ---
+            edge_pct = abs(px - mu) / mu
+            min_edge = FEE_ROUNDTRIP + EDGE_BUFFER  # ต้องใหญ่กว่าค่า fee ทั้งรอบ + buffer
+
+            if edge_pct < min_edge:
+                log(f"[SKIP EDGE] px={px:.4f} mu={mu:.4f} edge={edge_pct*100:.2f}% < {min_edge*100:.2f}% | z={z:.2f}")
+                time.sleep(REFRESH_SEC)
+                continue
+            # ------------------------------------------------
 
             bid_px = round(px * (1 - SLIPPAGE_BPS / 10000), PRICE_ROUND)
             ask_px = round(px * (1 + SLIPPAGE_BPS / 10000), PRICE_ROUND)
@@ -653,9 +682,9 @@ def run_loop():
             # แสดงราคาที่ใช้ กับเทรดล่าสุดเพื่อเช็คความแม่น
             last_trade = trades[-1]
             try:
-                log(f"[PRICE] vwap_tail={px:.4f} | last_trade_rate={last_trade['rate']:.4f} amt={last_trade['amount']}")
+                log(f"[PRICE] vwap_tail={px:.4f} mu={mu:.4f} | last_trade_rate={last_trade['rate']:.4f} amt={last_trade['amount']} | z={z:.2f}")
             except Exception:
-                log(f"[PRICE] vwap_tail={px:.4f} | last_trade={last_trade}")
+                log(f"[PRICE] vwap_tail={px:.4f} mu={mu:.4f} | last_trade={last_trade} | z={z:.2f}")
 
             # --------- COOLDOWN CHECK ----------
             now_ts = time.time()
@@ -706,7 +735,7 @@ def run_loop():
                         else:
                             log("[SKIP SELL] qty too small after rounding")
             else:
-                log(f"[HOLD] px={px:.4f} z={z:.2f} bid≈{bid_px} ask≈{ask_px}")
+                log(f"[HOLD] px={px:.4f} z={z:.2f} bid≈{bid_px} ask≈{ask_px} edge={edge_pct*100:.2f}%")
                 # ถ้าอยากเห็นสถานะบ่อยขึ้น เปิดบรรทัดนี้ได้
                 # log_position(px)
 
