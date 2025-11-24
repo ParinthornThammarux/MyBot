@@ -100,7 +100,7 @@ def http_post(url, headers=None, data="{}", timeout=HTTP_TIMEOUT):
         try:
             r = session.post(url, headers=h, data=data, timeout=timeout)
             if DEBUG_HTTP:
-                body_dbg = data if len(data) < 300 else data[:300] + "...(+)"
+                body_dbg = data if len(data) < 300 else data[:300] + "...(+)"""
                 print(f"[HTTP POST] {r.request.method} {r.url} -> {r.status_code} body={body_dbg}")
             r.raise_for_status()
             return r
@@ -280,15 +280,15 @@ def market_balances() -> Dict[str, Any]:
 
 # Timeframe สำหรับ TradingView API ของ Bitkub
 # 4H = "240", 1H = "60"
-RESOLUTION = "60"        # "240" = 4H, "60" = 1H
+RESOLUTION = "15"        # "240" = 4H, "60" = 1H
 CANDLE_LIMIT = 300        # จำนวนแท่งเทียนย้อนหลังสำหรับคำนวณอินดิเคเตอร์
 
 RSI_LENGTH = 14
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
 
-EMA_FAST = 50             # EMA 50
-EMA_SLOW = 200            # EMA 200
+EMA_FAST = 20             # EMA 20
+EMA_SLOW = 50            # EMA 50
 
 ENABLE_SHORT = False      # Bitkub ไม่มี short margin ตรงๆ -> ให้ False ไว้ก่อน
 
@@ -380,6 +380,21 @@ def detect_signal(df: pd.DataFrame, in_long: bool, in_short: bool) -> Dict[str, 
     คืนค่า signal เป็น dict:
       { "signal": "NONE|LONG_ENTRY|LONG_EXIT|SHORT_ENTRY|SHORT_EXIT",
         "reason": str }
+
+    เงื่อนไข (เวอร์ชันปรับแล้ว):
+
+    - LONG_ENTRY:
+        1) ยังไม่มี Long
+        2) EMA50 > EMA200  (Uptrend)
+        3) ราคา close ปัจจุบัน > EMA50 (ราคาอยู่เหนือเส้น EMA ระยะสั้น)
+        4) RSI ตัดขึ้นจากโซน oversold (prev < 30, now >= 30)
+
+    - LONG_EXIT:
+        1) มี Long อยู่
+        2) อย่างใดอย่างหนึ่งต่อไปนี้เป็นจริง:
+            - RSI ตัดลงจากโซน overbought (prev > 70, now <= 70)
+            - หรือ EMA50 < EMA200 (เทรนด์ใหญ่กลับเป็นลง)
+            - หรือ ราคา close < EMA50 (ราคาเริ่มหลุดเส้น EMA ระยะสั้น)
     """
     if df.empty or len(df) < EMA_SLOW + 5:
         return {"signal": "NONE", "reason": "WARMUP"}
@@ -387,37 +402,46 @@ def detect_signal(df: pd.DataFrame, in_long: bool, in_short: bool) -> Dict[str, 
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
+    price_now = float(last["close"])
     ema_fast_now = float(last["ema_fast"])
     ema_slow_now = float(last["ema_slow"])
     rsi_now = float(last["rsi"])
     rsi_prev = float(prev["rsi"])
 
     # ถ้ายังไม่มีค่า indicator (NaN)
-    if any(pd.isna([ema_fast_now, ema_slow_now, rsi_now, rsi_prev])):
+    if any(pd.isna([price_now, ema_fast_now, ema_slow_now, rsi_now, rsi_prev])):
         return {"signal": "NONE", "reason": "INDICATOR_NAN"}
 
     uptrend = ema_fast_now > ema_slow_now
     downtrend = ema_fast_now < ema_slow_now
 
     # ---------- LONG SIDE ----------
-    # กติกาเข้า Long:
-    # 1) EMA 50 > EMA 200  (ขาขึ้น)
-    # 2) RSI oversold ต่ำกว่า 30 แล้วตัดขึ้นกลับ (prev < 30, now >= 30)
-    long_entry_cond = (not in_long) and uptrend and (rsi_prev < RSI_OVERSOLD <= rsi_now)
+    # เข้า Long:
+    # - เทรนด์ขึ้น (EMA50 > EMA200)
+    # - ราคาอยู่เหนือ EMA50 (ไม่ฝืนเทรนด์สั้น)
+    # - RSI ตัดขึ้นจาก oversold zone
+    long_entry_cond = (
+        (not in_long)
+        and uptrend
+        and (price_now > ema_fast_now)
+        and (rsi_prev < RSI_OVERSOLD <= rsi_now)
+    )
 
-    # กติกาออก Long:
-    # - RSI จากเหนือ 70 ตัดลงกลับ (prev > 70, now <= 70)
-    #   หรือ trend เปลี่ยนเป็นลง (EMA50 < EMA200)
+    # ออก Long:
+    # - RSI เย็นลงจากโซน overbought
+    #   หรือ เทรนด์ใหญ่กลับลง
+    #   หรือ ราคาเริ่มหลุด EMA50
     long_exit_cond = in_long and (
         (rsi_prev > RSI_OVERBOUGHT >= rsi_now) or
-        downtrend
+        downtrend or
+        (price_now < ema_fast_now)
     )
 
     if long_entry_cond:
-        return {"signal": "LONG_ENTRY", "reason": "Uptrend + RSI cross up from oversold"}
+        return {"signal": "LONG_ENTRY", "reason": "Uptrend + price>EMA50 + RSI cross up from oversold"}
 
     if long_exit_cond:
-        return {"signal": "LONG_EXIT", "reason": "RSI cooled down or trend flipped down"}
+        return {"signal": "LONG_EXIT", "reason": "RSI cooled down or trend flipped down or price<EMA50"}
 
     # ---------- SHORT SIDE (ตัวอย่าง logic เฉย ๆ เผื่อใช้ภายหลัง) ----------
     if ENABLE_SHORT:
