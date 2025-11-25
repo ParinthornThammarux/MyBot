@@ -1,0 +1,7 @@
+{
+    "UP": "\u001b[92m",
+    "DOWN": "\u001b[91m",
+    "SIDEWAYS": "\u001b[93m",
+    "UNKNOWN": "\u001b[2m",
+    "RESET": "\u001b[0m"
+}

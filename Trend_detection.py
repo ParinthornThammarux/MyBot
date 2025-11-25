@@ -3,6 +3,9 @@ import requests
 import pandas as pd
 import pandas_ta as ta
 import psutil , os
+import numpy as np
+import json
+from tabulate import tabulate
 pd.set_option('display.max_rows',None)
 BITKUB_TV_URL = "https://api.bitkub.com/tradingview/history"
 
@@ -18,7 +21,28 @@ timeframes = {
     "4h": "240",   # 240 นาที
     "1d": "1D",    # 1 วัน
 }
+with open("config/color.json", "r", encoding="utf-8") as f:
+    COLORS = json.load(f)
 
+def color_trend(val: str) -> str:
+    if val is None:
+        return "-"
+    
+    text = str(val)
+
+    if text.startswith("ERROR"):
+        return f"{COLORS['DOWN']}{text}{COLORS['RESET']}"
+
+    if text in COLORS:
+        return f"{COLORS[text]}{text}{COLORS['RESET']}"
+    
+    return text
+
+def print_pretty_table(df):
+    df_fmt = df.copy()
+    if "trend" in df_fmt.columns:
+        df_fmt["trend"] = df_fmt["trend"].apply(color_trend)
+    print(tabulate(df_fmt, headers="keys", tablefmt="grid", showindex=False))
 
 def fetch_ohlcv(symbol: str, resolution: str, bars: int = 300) -> pd.DataFrame:
     """
@@ -164,23 +188,16 @@ def build_trend_table(
                         "bars_count": 0,
                     }
                 )
-            rows.append({
-            "symbol": "",
-            "timeframe": "",
-            "last_time": "",
-            "close": "",
-            "ema_fast": "",
-            "ema_slow": "",
-            "adx": "",
-            "trend": ""
-        })
+
 
     return pd.DataFrame(rows)
 
 
 if __name__ == "__main__":
     trend_df = build_trend_table(currency, timeframes, bars=200)
-    print(trend_df)
+    for sym, group in trend_df.groupby("symbol"):
+        print(f"\n===== {sym} =====\n")
+        print_pretty_table(group)
     process = psutil.Process(os.getpid())
     memory_used = process.memory_info().rss / (1024 ** 2)  # MB
     print(f"Memory Used: {memory_used:.2f} MB")

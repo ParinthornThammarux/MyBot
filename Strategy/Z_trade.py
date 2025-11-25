@@ -94,13 +94,13 @@ WINDOW = 30                # จำนวนจุดข้อมูลที่
 REFRESH_SEC = 60           # วินาทีต่อการวนลูป 1 รอบ
 TRADES_FETCH = max(200, WINDOW + 20)
 
-THRESH_Z = 2.8
+THRESH_Z = 2.1
 ORDER_NOTIONAL_THB = 100
 SLIPPAGE_BPS = 6           # slippage (bps) สำหรับตั้ง bid/ask ให้ match ง่ายขึ้น
 
 FEE_RATE = 0.0025          # 0.25% ต่อข้าง (ซื้อ 0.25% + ขาย 0.25%)
 FEE_ROUNDTRIP = 2 * FEE_RATE   # ~0.5% ไป-กลับ
-EDGE_BUFFER   = 0.003          # 0.3% เผื่อ slippage/noise (ปรับได้)
+EDGE_BUFFER   = 0.001          # 0.3% เผื่อ slippage/noise (ปรับได้)
 
 DRY_RUN = True             # True = ทดสอบ, False = ยิง order จริง
 

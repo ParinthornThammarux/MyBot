@@ -286,9 +286,9 @@ CANDLE_LIMIT = 300        # จำนวนแท่งเทียนย้อ�
 RSI_LENGTH = 14
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
-
-EMA_FAST = 20             # EMA 20
-EMA_SLOW = 50            # EMA 50
+    
+EMA_FAST = 50             # EMA 50
+EMA_SLOW = 200            # EMA 200
 
 ENABLE_SHORT = False      # Bitkub ไม่มี short margin ตรงๆ -> ให้ False ไว้ก่อน
 
