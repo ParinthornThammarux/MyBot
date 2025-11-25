@@ -32,27 +32,27 @@ API_SECRET = (os.getenv("BITKUB_API_SECRET", "") or "").encode()
 
 SYMBOL = "XRP_THB"
 
-REFRESH_SEC = 60*5           # วินาทีต่อการวนลูป 1 รอบ
+REFRESH_SEC = 305         # วินาทีต่อการวนลูป 1 รอบ
 
-ORDER_NOTIONAL_THB = 100   # ขนาด order ต่อครั้ง (THB)
-SLIPPAGE_BPS = 6           # slippage (bps) สำหรับตั้ง bid/ask ให้ match ง่ายขึ้น
+ORDER_NOTIONAL_THB = 100     # ขนาด order ต่อครั้ง (THB)
+SLIPPAGE_BPS = 6             # slippage (bps) สำหรับตั้ง bid/ask ให้ match ง่ายขึ้น
 
-FEE_RATE = 0.0025          # 0.25% ต่อข้าง (ซื้อ 0.25% + ขาย 0.25%)
-DRY_RUN = True             # True = ทดสอบ, False = ยิง order จริง
+FEE_RATE = 0.0025            # 0.25% ต่อข้าง (ซื้อ 0.25% + ขาย 0.25%)
+DRY_RUN = True               # True = ทดสอบ, False = ยิง order จริง
 
 PRICE_ROUND = 2
 QTY_ROUND = 6
 
-TIME_SYNC_INTERVAL = 300   # วินาทีในการ resync server time
-COOLDOWN_SEC = 300         # วินาที cooldown หลังเทรด (เช่น 300 = 5 นาที)
+TIME_SYNC_INTERVAL = 300     # วินาทีในการ resync server time
+COOLDOWN_SEC = 300           # วินาที cooldown หลังเทรด (เช่น 300 = 5 นาที)
 
-POS_FILE = "Cost.json"     # ไฟล์เก็บสถานะ position
+POS_FILE = "Cost.json"       # ไฟล์เก็บสถานะ position
 
 # Debug/Networking
 DEBUG_HTTP = True
 HTTP_TIMEOUT = 12
 RETRY_MAX = 4
-RETRY_BASE_DELAY = 0.6     # seconds
+RETRY_BASE_DELAY = 0.6       # seconds
 
 COMMON_HEADERS = {
     "Accept": "application/json",
@@ -100,7 +100,7 @@ def http_post(url, headers=None, data="{}", timeout=HTTP_TIMEOUT):
         try:
             r = session.post(url, headers=h, data=data, timeout=timeout)
             if DEBUG_HTTP:
-                body_dbg = data if len(data) < 300 else data[:300] + "...(+)"""
+                body_dbg = data if len(data) < 300 else data[:300] + "...(+)"
                 print(f"[HTTP POST] {r.request.method} {r.url} -> {r.status_code} body={body_dbg}")
             r.raise_for_status()
             return r
@@ -275,28 +275,25 @@ def market_balances() -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------
-# [5] STRATEGY CONFIG - RSI + EMA Trend Filter
+# [5] STRATEGY CONFIG - RSI + ADX ONLY
 # ------------------------------------------------------------
 
-# Timeframe สำหรับ TradingView API ของ Bitkub
-# 4H = "240", 1H = "60"
-RESOLUTION = "15"        # "240" = 4H, "60" = 1H
-CANDLE_LIMIT = 300        # จำนวนแท่งเทียนย้อนหลังสำหรับคำนวณอินดิเคเตอร์
+RESOLUTION = "5"          # "240" = 4H, "60" = 1H, "15" = 15m
+CANDLE_LIMIT = 300         # จำนวนแท่งเทียนย้อนหลังสำหรับคำนวณอินดิเคเตอร์
 
 RSI_LENGTH = 14
 RSI_OVERSOLD = 30
 RSI_OVERBOUGHT = 70
-    
-EMA_FAST = 50             # EMA 50
-EMA_SLOW = 200            # EMA 200
 
-ENABLE_SHORT = False      # Bitkub ไม่มี short margin ตรงๆ -> ให้ False ไว้ก่อน
+ADX_LENGTH = 14
+ADX_TREND_THRESHOLD = 20   # ADX > 20 ถือว่ามีเทรนด์พอสมควร
+
+ENABLE_SHORT = False       # Bitkub ไม่มี short margin ตรงๆ -> ให้ False ไว้ก่อน
 
 
 # ------------------------------------------------------------
 # [6] CANDLE FETCHING - TradingView API ของ Bitkub
 # ------------------------------------------------------------
-
 def fetch_candles(symbol: str, resolution: str, limit: int = 300) -> pd.DataFrame:
     """
     ดึงแท่งเทียนจาก Bitkub TradingView API
@@ -358,111 +355,113 @@ def fetch_candles(symbol: str, resolution: str, limit: int = 300) -> pd.DataFram
 # ------------------------------------------------------------
 # [7] INDICATORS + SIGNAL LOGIC
 # ------------------------------------------------------------
-
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    เติม EMA50, EMA200, RSI ลงใน DataFrame
+    เติม RSI, ADX, +DI, -DI ลงใน DataFrame
     """
     if df.empty:
         return df
 
     close = df["close"].astype(float)
+    high  = df["high"].astype(float)
+    low   = df["low"].astype(float)
 
-    df["ema_fast"] = ta.ema(close, length=EMA_FAST)
-    df["ema_slow"] = ta.ema(close, length=EMA_SLOW)
+    # RSI
     df["rsi"] = ta.rsi(close, length=RSI_LENGTH)
+
+    # ADX + DI
+    adx_df = ta.adx(high=high, low=low, close=close, length=ADX_LENGTH)
+    df["adx"]      = adx_df[f"ADX_{ADX_LENGTH}"]
+    df["plus_di"]  = adx_df[f"DMP_{ADX_LENGTH}"]   # +DI
+    df["minus_di"] = adx_df[f"DMN_{ADX_LENGTH}"]   # -DI
 
     return df
 
 
 def detect_signal(df: pd.DataFrame, in_long: bool, in_short: bool) -> Dict[str, Any]:
     """
-    คืนค่า signal เป็น dict:
-      { "signal": "NONE|LONG_ENTRY|LONG_EXIT|SHORT_ENTRY|SHORT_EXIT",
-        "reason": str }
+    Strategy: RSI + ADX
 
-    เงื่อนไข (เวอร์ชันปรับแล้ว):
+    - ใช้ ADX + DI ดูทิศทางและความแรงของเทรนด์
+    - ใช้ RSI หา timing เข้า/ออก
 
-    - LONG_ENTRY:
-        1) ยังไม่มี Long
-        2) EMA50 > EMA200  (Uptrend)
-        3) ราคา close ปัจจุบัน > EMA50 (ราคาอยู่เหนือเส้น EMA ระยะสั้น)
-        4) RSI ตัดขึ้นจากโซน oversold (prev < 30, now >= 30)
+    เงื่อนไข:
 
-    - LONG_EXIT:
-        1) มี Long อยู่
-        2) อย่างใดอย่างหนึ่งต่อไปนี้เป็นจริง:
-            - RSI ตัดลงจากโซน overbought (prev > 70, now <= 70)
-            - หรือ EMA50 < EMA200 (เทรนด์ใหญ่กลับเป็นลง)
-            - หรือ ราคา close < EMA50 (ราคาเริ่มหลุดเส้น EMA ระยะสั้น)
+    LONG_ENTRY:
+      1) ยังไม่มี Long
+      2) ADX_now > ADX_TREND_THRESHOLD (มีเทรนด์ชัดพอ)
+      3) +DI_now > -DI_now (ฝั่งขึ้นได้เปรียบ)
+      4) RSI ตัดขึ้นจาก oversold (prev < RSI_OVERSOLD, now >= RSI_OVERSOLD)
+
+    LONG_EXIT:
+      1) มี Long อยู่
+      2) อย่างใดอย่างหนึ่งเป็นจริง:
+         - RSI ตัดลงจาก overbought (prev > RSI_OVERBOUGHT, now <= RSI_OVERBOUGHT)
+         - หรือ -DI_now > +DI_now (แรงขายกลับมาชนะ)
+         - หรือ ADX_now ลดต่ำกว่า ADX_TREND_THRESHOLD * 0.8 (เทรนด์เริ่มอ่อน)
     """
-    if df.empty or len(df) < EMA_SLOW + 5:
+    if df.empty or len(df) < ADX_LENGTH + 5:
         return {"signal": "NONE", "reason": "WARMUP"}
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    price_now = float(last["close"])
-    ema_fast_now = float(last["ema_fast"])
-    ema_slow_now = float(last["ema_slow"])
-    rsi_now = float(last["rsi"])
-    rsi_prev = float(prev["rsi"])
+    # ดึงค่า indicator ล่าสุด
+    price_now      = float(last["close"])
+    rsi_now        = float(last["rsi"])
+    rsi_prev       = float(prev["rsi"])
+    adx_now        = float(last["adx"])
+    plus_di_now    = float(last["plus_di"])
+    minus_di_now   = float(last["minus_di"])
 
-    # ถ้ายังไม่มีค่า indicator (NaN)
-    if any(pd.isna([price_now, ema_fast_now, ema_slow_now, rsi_now, rsi_prev])):
+    # ถ้ายังมี NaN อยู่ แปลว่ายัง warmup indicator ไม่ครบ
+    if any(pd.isna([price_now, rsi_now, rsi_prev, adx_now, plus_di_now, minus_di_now])):
         return {"signal": "NONE", "reason": "INDICATOR_NAN"}
 
-    uptrend = ema_fast_now > ema_slow_now
-    downtrend = ema_fast_now < ema_slow_now
+    strong_trend = adx_now > ADX_TREND_THRESHOLD
+    up_trend     = plus_di_now > minus_di_now
+    down_trend   = minus_di_now > plus_di_now
 
-    # ---------- LONG SIDE ----------
-    # เข้า Long:
-    # - เทรนด์ขึ้น (EMA50 > EMA200)
-    # - ราคาอยู่เหนือ EMA50 (ไม่ฝืนเทรนด์สั้น)
-    # - RSI ตัดขึ้นจาก oversold zone
+    # ---------- LONG ENTRY ----------
     long_entry_cond = (
         (not in_long)
-        and uptrend
-        and (price_now > ema_fast_now)
-        and (rsi_prev < RSI_OVERSOLD <= rsi_now)
+        and strong_trend
+        and up_trend
+        and (rsi_prev < RSI_OVERSOLD <= rsi_now)  # RSI cross up oversold
     )
 
-    # ออก Long:
-    # - RSI เย็นลงจากโซน overbought
-    #   หรือ เทรนด์ใหญ่กลับลง
-    #   หรือ ราคาเริ่มหลุด EMA50
+    # ---------- LONG EXIT ----------
     long_exit_cond = in_long and (
-        (rsi_prev > RSI_OVERBOUGHT >= rsi_now) or
-        downtrend or
-        (price_now < ema_fast_now)
+        (rsi_prev > RSI_OVERBOUGHT >= rsi_now) or      # RSI ออกจากโซน overbought
+        (down_trend) or                                # แรงขายกลับมาชนะ
+        (adx_now < ADX_TREND_THRESHOLD * 0.8)         # เทรนด์เริ่มอ่อน
     )
 
     if long_entry_cond:
-        return {"signal": "LONG_ENTRY", "reason": "Uptrend + price>EMA50 + RSI cross up from oversold"}
+        return {
+            "signal": "LONG_ENTRY",
+            "reason": (
+                "ADX strong uptrend (ADX>threshold, +DI>-DI) "
+                "+ RSI cross up from oversold"
+            ),
+        }
 
     if long_exit_cond:
-        return {"signal": "LONG_EXIT", "reason": "RSI cooled down or trend flipped down or price<EMA50"}
+        return {
+            "signal": "LONG_EXIT",
+            "reason": (
+                "RSI cooled down from overbought or sellers dominate "
+                "or trend strength dropped"
+            ),
+        }
 
-    # ---------- SHORT SIDE (ตัวอย่าง logic เฉย ๆ เผื่อใช้ภายหลัง) ----------
-    if ENABLE_SHORT:
-        short_entry_cond = (not in_short) and downtrend and (rsi_prev > RSI_OVERBOUGHT >= rsi_now)
-        short_exit_cond = in_short and (
-            (rsi_prev < RSI_OVERSOLD <= rsi_now) or
-            uptrend
-        )
-
-        if short_entry_cond:
-            return {"signal": "SHORT_ENTRY", "reason": "Downtrend + RSI cross down from overbought"}
-        if short_exit_cond:
-            return {"signal": "SHORT_EXIT", "reason": "RSI cooled down or trend flipped up"}
-
+    # ยังไม่รองรับฝั่ง short จริงใน Bitkub อยู่แล้ว
     return {"signal": "NONE", "reason": "NO_CONDITION"}
 
 
 # ------------------------------------------------------------
 # [8] POSITION MANAGEMENT (ใช้ไฟล์ POS_FILE)
 # ------------------------------------------------------------
-
 def load_position() -> Dict[str, Any]:
     p = Path(POS_FILE)
     if not p.exists():
@@ -515,7 +514,6 @@ def get_balances_safe() -> Dict[str, Any]:
 # ------------------------------------------------------------
 # [9] EXECUTION HELPERS (ซื้อ/ขาย)
 # ------------------------------------------------------------
-
 def open_long_market_like(last_price: float, dry_run: bool = DRY_RUN):
     """
     ซื้อด้วย THB ตาม ORDER_NOTIONAL_THB (หรือเท่าที่มี)
@@ -589,11 +587,10 @@ def close_long_market_like(last_price: float, dry_run: bool = DRY_RUN):
 
 
 # ------------------------------------------------------------
-# [10] MAIN LOOP - RSI + EMA Trend Filter BOT
+# [10] MAIN LOOP - RSI + ADX BOT
 # ------------------------------------------------------------
-
 def main_loop():
-    log(f"[INIT] Starting RSI+EMA bot on {SYMBOL}, TF={RESOLUTION}, DRY_RUN={DRY_RUN}")
+    log(f"[INIT] Starting RSI+ADX bot on {SYMBOL}, TF={RESOLUTION}, DRY_RUN={DRY_RUN}")
     sync_server_time()
 
     last_candle_ts = None
@@ -621,12 +618,16 @@ def main_loop():
             # เติม indicators
             df = add_indicators(df)
             last = df.iloc[-1]
-            price = float(last["close"])
-            ema_fast = float(last.get("ema_fast", float("nan")))
-            ema_slow = float(last.get("ema_slow", float("nan")))
-            rsi_val = float(last.get("rsi", float("nan")))
+            price     = float(last["close"])
+            rsi_val   = float(last.get("rsi", float("nan")))
+            adx_val   = float(last.get("adx", float("nan")))
+            plus_di   = float(last.get("plus_di", float("nan")))
+            minus_di  = float(last.get("minus_di", float("nan")))
 
-            log(f"[PRICE] close={price:.4f}, ema50={ema_fast:.4f}, ema200={ema_slow:.4f}, rsi={rsi_val:.2f}")
+            log(
+                f"[PRICE] close={price:.4f}, rsi={rsi_val:.2f}, "
+                f"adx={adx_val:.2f}, +di={plus_di:.2f}, -di={minus_di:.2f}"
+            )
 
             pos = load_position()
             in_long = pos.get("side") == "LONG" and pos.get("qty", 0) > 0
