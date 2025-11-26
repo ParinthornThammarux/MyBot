@@ -14,47 +14,58 @@ BITKUB_TV_URL = "https://api.bitkub.com/tradingview/history"
 
 currency = ["XRP_THB", "BTC_THB", "ETH_THB", "USDT_THB", "KUB_THB", "ADA_THB", "BNB_THB"]
 
-# ใช้ string resolution แบบ TradingView / Bitkub
 timeframes = {
     "1m": "1",
-    "5m": "5",     # 5 นาที
-    "15m": "15",   # 15 นาที
+    "5m": "5",
+    "15m": "15",
     "30m": "30",
-    "1h": "60",    # 60 นาที
-    "4h": "240",   # 240 นาที
-    "1d": "1D",    # 1 วัน
+    "1h": "60",
+    "4h": "240",
+    "1d": "1D",
 }
 
-# โหลดสีจากไฟล์ config
 with open("config/color.json", "r", encoding="utf-8") as f:
     COLORS = json.load(f)
 
 
 def color_trend(val: str) -> str:
-    """
-    ใช้ใส่สีให้ค่า trend ตอนแสดงตาราง
-    """
     if val is None:
         return "-"
-
     text = str(val)
 
+    # ถ้าเป็น error ให้ใช้สี DOWN
     if text.startswith("ERROR"):
-        return f"{COLORS['DOWN']}{text}{COLORS['RESET']}"
+        return f"{COLORS.get('DOWN', '')}{text}{COLORS.get('RESET', '')}"
 
+    # ถ้า text ตรงกับ key สีในไฟล์ config
     if text in COLORS:
-        return f"{COLORS[text]}{text}{COLORS['RESET']}"
+        return f"{COLORS[text]}{text}{COLORS.get('RESET', '')}"
 
     return text
 
 
 def print_pretty_table(df: pd.DataFrame):
     """
-    พิมพ์ DataFrame เป็นตารางสวย ๆ ใน console
+    แสดงทุกคอลัมน์ + ใส่สี trend + format atr/tp ไม่ให้เห็น NaN ตรง ๆ
     """
     df_fmt = df.copy()
+
+    # ใส่สี trend ถ้ามี
     if "trend" in df_fmt.columns:
         df_fmt["trend"] = df_fmt["trend"].apply(color_trend)
+
+    # จัดการ NaN ในคอลัมน์ atr / tp1 / tp2 แปลงให้เป็น "-" ตอนแสดงผล
+    for col in ["atr", "tp1", "tp2"]:
+        if col in df_fmt.columns:
+            def _fmt(x):
+                if pd.isna(x):
+                    return "-"
+                try:
+                    return round(float(x), 4)
+                except Exception:
+                    return x
+            df_fmt[col] = df_fmt[col].apply(_fmt)
+
     print(tabulate(df_fmt, headers="keys", tablefmt="grid", showindex=False))
 
 
@@ -91,8 +102,8 @@ def fetch_ohlcv(symbol: str, resolution: str, bars: int = 300) -> pd.DataFrame:
 
     df = pd.DataFrame(
         {
-            # 👇 แปลงจาก UTC -> เวลาไทยชัด ๆ
-            "time": pd.to_datetime(pd.Series(data["t"]), unit="s", utc=True).dt.tz_convert("Asia/Bangkok"),
+            # แปลงจาก UTC -> เวลาไทย
+            "time": pd.to_datetime(pd.Series(data["t"]), unit="s", utc=True).dt.tz_convert("Asia/Bangkok").dt.tz_localize(None),
             "open": data["o"],
             "high": data["h"],
             "low": data["l"],
@@ -117,18 +128,21 @@ def detect_trend(
     super_mult: float = 3.0,
 ):
     """
-    ระบุเทรนด์จาก EMA(เร็ว/ช้า) + ADX + Supertrend
+    ระบุเทรนด์จาก EMA(เร็ว/ช้า) + ADX + Supertrend + ATR และคำนวณ TP1/TP2
     """
     df = df.copy()
 
-    # ถ้าแท่งไม่พอคำนวณ indicator เลย ให้บอก UNKNOWN ไปก่อน
+    # ถ้าแท่งไม่พอคำนวณ indicator ให้ UNKNOWN ไปก่อน
     if len(df) < max(slow, adx_len + 1, super_len + 1):
-        last = df.iloc[-1]
-        last["ema_fast"] = None
-        last["ema_slow"] = None
-        last["adx"] = None
-        last["supertrend"] = None
-        last["supertrend_dir"] = None
+        last = df.iloc[-1].copy()
+        last["ema_fast"] = np.nan
+        last["ema_slow"] = np.nan
+        last["adx"] = np.nan
+        last["supertrend"] = np.nan
+        last["supertrend_dir"] = np.nan
+        last["atr"] = np.nan
+        last["tp1"] = np.nan
+        last["tp2"] = np.nan
         return "UNKNOWN", last
 
     # EMA
@@ -148,39 +162,49 @@ def detect_trend(
         length=super_len,
         multiplier=super_mult,
     )
-    # pandas_ta.supertrend จะคืน DataFrame หลายคอลัมน์ เช่น:
-    # ['SUPERT_10_3.0', 'SUPERTd_10_3.0', 'SUPERTl_10_3.0', 'SUPERTs_10_3.0']
+    # pandas_ta.supertrend คืนคอลัมน์ประมาณ: SUPERT_10_3.0, SUPERTd_10_3.0, ...
     st_price_col = [c for c in st.columns if c.startswith("SUPERT_")][0]
     st_dir_col = [c for c in st.columns if c.startswith("SUPERTd_")][0]
 
     df["supertrend"] = st[st_price_col]
     df["supertrend_dir"] = st[st_dir_col]
 
-    last = df.iloc[-1]
+    # ATR
+    df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
 
-    # ถ้ายัง NaN อยู่ แสดงว่ายังคำนวณไม่ครบแท่ง
-    if (
-        pd.isna(last["ema_fast"])
-        or pd.isna(last["ema_slow"])
-        or pd.isna(last["adx"])
-        or pd.isna(last["supertrend"])
-        or pd.isna(last["supertrend_dir"])
-    ):
+    last = df.iloc[-1].copy()
+
+    # ถ้า indicator ตัวใดตัวหนึ่งในชุดนี้ยังเป็น NaN ให้ถือว่าไม่พร้อมใช้
+    required_cols = ["ema_fast", "ema_slow", "adx", "supertrend", "supertrend_dir", "atr"]
+    if df[required_cols].iloc[-1].isna().any():
+        last["tp1"] = np.nan
+        last["tp2"] = np.nan
         return "UNKNOWN", last
 
-    # กติกาเทรนด์แบบใช้ทั้ง EMA + ADX + Supertrend
+    # คำนวณเทรนด์
     if last["adx"] < adx_threshold:
-        # ADX ต่ำ = เทรนด์อ่อน / ไซด์เวย์
         trend = "SIDEWAYS"
     else:
-        # ใช้ทั้ง EMA และทิศทาง Supertrend ช่วยกัน confirm
         if last["ema_fast"] > last["ema_slow"] and last["supertrend_dir"] > 0:
             trend = "UP"
         elif last["ema_fast"] < last["ema_slow"] and last["supertrend_dir"] < 0:
             trend = "DOWN"
         else:
-            # ไม่คอนเฟิร์มกัน ชี้ไปทางไซด์เวย์หรือไม่ชัด
             trend = "SIDEWAYS"
+
+    # คำนวณ TP จาก ATR เฉพาะเมื่อ trend ชัดเจน
+    close = float(last["close"])
+    atr = float(last["atr"])
+
+    if trend == "UP":
+        last["tp1"] = close + atr
+        last["tp2"] = close + 2 * atr
+    elif trend == "DOWN":
+        last["tp1"] = close - atr
+        last["tp2"] = close - 2 * atr
+    else:
+        last["tp1"] = np.nan
+        last["tp2"] = np.nan
 
     return trend, last
 
@@ -218,11 +242,14 @@ def build_trend_table(
                         "timeframe": tf_label,
                         "last_time": last["time"],
                         "close": float(last["close"]),
-                        "ema_fast": last["ema_fast"],
-                        "ema_slow": last["ema_slow"],
-                        "adx": last["adx"],
-                        "supertrend": last["supertrend"],
-                        "supertrend_dir": last["supertrend_dir"],
+                        "ema_fast": last.get("ema_fast", np.nan),
+                        "ema_slow": last.get("ema_slow", np.nan),
+                        "adx": last.get("adx", np.nan),
+                        "supertrend": last.get("supertrend", np.nan),
+                        "supertrend_dir": last.get("supertrend_dir", np.nan),
+                        "atr": last.get("atr", np.nan),
+                        "tp1": last.get("tp1", np.nan),
+                        "tp2": last.get("tp2", np.nan),
                         "trend": trend,
                         "bars_count": len(df),
                     }
@@ -239,6 +266,9 @@ def build_trend_table(
                         "adx": None,
                         "supertrend": None,
                         "supertrend_dir": None,
+                        "atr": None,
+                        "tp1": None,
+                        "tp2": None,
                         "trend": f"ERROR: {e}",
                         "bars_count": 0,
                     }
@@ -256,9 +286,10 @@ if __name__ == "__main__":
         slow=50,
         adx_len=14,
         adx_threshold=20.0,
-        super_len=10,      # ปรับ length ของ Supertrend ได้
-        super_mult=3.0,    # ปรับ multiplier ของ Supertrend ได้
+        super_len=10,
+        super_mult=3.0,
     )
+
 
     for sym, group in trend_df.groupby("symbol"):
         print(f"\n===== {sym} =====\n")
