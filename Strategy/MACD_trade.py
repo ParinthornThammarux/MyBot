@@ -30,7 +30,7 @@ BASE_URL = "https://api.bitkub.com"
 API_KEY  = os.getenv("BITKUB_API_KEY", "")
 API_SECRET = (os.getenv("BITKUB_API_SECRET", "") or "").encode()
 
-SYMBOL = "XRP_THB"          # ใช้คู่เทรดสำหรับส่งออเดอร์
+SYMBOL = "XRP_THB"          # ใช้คู่เทรดสำหรับส่งออเดอร์   
 
 REFRESH_SEC = 60            # วินาทีต่อการวนลูป 1 รอบ
 ORDER_NOTIONAL_THB = 100    # ขนาดออเดอร์ต่อไม้ (THB)
@@ -47,8 +47,17 @@ COOLDOWN_SEC = 300          # วินาที cooldown หลังเทร�
 
 POS_FILE = "Cost.json"      # ไฟล์เก็บสถานะ position
 
+# ------------------------------------------------------------
+# [1.1] RISK / TREND CONFIG
+# ------------------------------------------------------------
+SL_PCT = 0.01               # -1% stop-loss จากราคา entry
+TP_PCT = 0.02               # +2% take-profit จากราคา entry
+
+HTF_RESOLUTION = "60"       # higher timeframe: 60 = 1h candles
+HTF_LOOKBACK_BARS = 200     # จำนวนแท่ง TF ใหญ่ที่ดึงมา
+
 # Debug/Networking
-DEBUG_HTTP = True
+DEBUG_HTTP = False
 HTTP_TIMEOUT = 12
 RETRY_MAX = 4
 RETRY_BASE_DELAY = 0.6      # seconds
@@ -142,7 +151,9 @@ def color_for(msg: str) -> str:
         return FG_BLUE + BOLD
     if msg.startswith("[HOLD]"):
         return FG_CYAN
-    if msg.startswith("[MACD]"):
+    if msg.startswith("[MACD"):
+        return FG_BLUE
+    if msg.startswith("[HTF]"):
         return FG_BLUE
     if msg.startswith("[BUY "):
         return FG_GREEN + BOLD
@@ -223,7 +234,7 @@ def place_bid(sym: str, thb_amount: float, rate: float, dry_run: bool) -> Dict[s
     ts = ts_ms_str()
     payload = {
         "sym": sym,
-        "amt": float(int(thb_amount)),               # ถ้า Bitkub รองรับทศนิยม ค่อยปรับตรงนี้
+        "amt": float(int(thb_amount)),               # แปลงเป็นจำนวนเต็ม THB
         "rat": float(round(rate, PRICE_ROUND)),
         "typ": "limit",
     }
@@ -299,6 +310,9 @@ def load_pos() -> Dict[str, Any]:
 
 
 def save_pos(pos: Dict[str, Any]):
+    if DRY_RUN:
+        log(f"[POS] DRY_RUN=True -> skip writing position file: {pos}")
+        return
     try:
         with open(POS_FILE, "w", encoding="utf-8") as f:
             json.dump(pos, f, ensure_ascii=False, indent=2)
@@ -308,19 +322,28 @@ def save_pos(pos: Dict[str, Any]):
 
 
 # ------------------------------------------------------------
-# [7] OHLCV (5m candles) VIA tradingview/history
+# [7] OHLCV VIA tradingview/history (generic)
 # ------------------------------------------------------------
 FIVE_MIN_SEC = 5 * 60
 
 
-def fetch_5m_candles(sym: str, lookback_bars: int = 200) -> List[Dict[str, Any]]:
+def fetch_candles(sym: str, resolution: str, lookback_bars: int = 200) -> List[Dict[str, Any]]:
+    """
+    Generic OHLCV fetcher via /tradingview/history.
+    resolution: '5' for 5m, '60' for 1h, etc.
+    """
+    if resolution.isdigit():
+        bar_sec = int(resolution) * 60
+    else:
+        bar_sec = FIVE_MIN_SEC
+
     now_sec = now_server_ms() // 1000
-    frm = now_sec - lookback_bars * FIVE_MIN_SEC - FIVE_MIN_SEC
+    frm = now_sec - lookback_bars * bar_sec - bar_sec
 
     url = f"{BASE_URL}/tradingview/history"
     params = {
-        "symbol": sym,        # เช่น "XRP_THB"
-        "resolution": "5",    # 5 นาที
+        "symbol": sym,
+        "resolution": resolution,
         "from": frm,
         "to": now_sec
     }
@@ -330,7 +353,7 @@ def fetch_5m_candles(sym: str, lookback_bars: int = 200) -> List[Dict[str, Any]]
 
     # ปกติจะเป็น: { "s":"ok", "t":[...], "o":[...], "h":[...], "l":[...], "c":[...], "v":[...] }
     if not isinstance(data, dict) or data.get("s") != "ok":
-        log(f"[ERROR] fetch_5m_candles unexpected payload: {data}")
+        log(f"[ERROR] fetch_candles({sym},{resolution}) unexpected payload: {data}")
         return []
 
     ts_list = data.get("t", [])
@@ -355,10 +378,15 @@ def fetch_5m_candles(sym: str, lookback_bars: int = 200) -> List[Dict[str, Any]]
     return candles
 
 
+def fetch_5m_candles(sym: str, lookback_bars: int = 200) -> List[Dict[str, Any]]:
+    """Backward-compatible wrapper for 5m candles."""
+    return fetch_candles(sym, "5", lookback_bars)
+
+
 # ------------------------------------------------------------
 # [8] MACD ด้วย pandas-ta
 # ------------------------------------------------------------
-def macd_signal_from_candles(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+def macd_signal_from_candles(candles: List[Dict[str, Any]], label: str = "MACD") -> Dict[str, Any]:
     if len(candles) < 50:
         return {"signal": "HOLD"}
 
@@ -398,7 +426,7 @@ def macd_signal_from_candles(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
         sig = "HOLD"
 
     log(
-        f"[MACD] macd_now={macd_now:.6f} signal_now={sig_now:.6f} "
+        f"[MACD {label}] macd_now={macd_now:.6f} signal_now={sig_now:.6f} "
         f"hist={hist_now:.6f} -> {sig}"
     )
     return {
@@ -406,6 +434,37 @@ def macd_signal_from_candles(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
         "macd": float(macd_now),
         "signal_line": float(sig_now),
         "hist": float(hist_now),
+    }
+
+
+def htf_trend_from_macd(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    ใช้ MACD TF ใหญ่ (เช่น 1h) เป็น trend filter
+    คืนค่า: trend = {'BULL','BEAR','NEUTRAL'}
+    """
+    info = macd_signal_from_candles(candles, label=f"{HTF_RESOLUTION}m")
+    macd_val = info.get("macd")
+    sig_val = info.get("signal_line")
+    hist_val = info.get("hist")
+
+    if macd_val is None or sig_val is None or hist_val is None:
+        return {"trend": "NEUTRAL"}
+
+    if macd_val > sig_val and hist_val > 0:
+        trend = "BULL"
+    elif macd_val < sig_val and hist_val < 0:
+        trend = "BEAR"
+    else:
+        trend = "NEUTRAL"
+
+    log(
+        f"[HTF] trend={trend} macd={macd_val:.6f} signal={sig_val:.6f} hist={hist_val:.6f}"
+    )
+    return {
+        "trend": trend,
+        "macd": macd_val,
+        "signal_line": sig_val,
+        "hist": hist_val,
     }
 
 
@@ -423,34 +482,108 @@ def can_trade_after_cooldown(pos: Dict[str, Any]) -> bool:
 
 
 # ------------------------------------------------------------
-# [10] EXECUTE STRATEGY (MACD 5m) - ใช้เฉพาะราคา close
+# [10] EXECUTE STRATEGY (MACD 5m + SL/TP + HTF) 
 # ------------------------------------------------------------
 def decide_and_trade_macd():
     pos = load_pos()
     side = pos.get("side", "FLAT")
+    qty_pos = pos.get("qty", 0.0)
+    entry_price = pos.get("entry_price", 0.0)
 
-    candles = fetch_5m_candles(SYMBOL, lookback_bars=200)
-    if not candles:
-        log("[ERROR] No candles fetched, skip this round")
+    # --- ดึงข้อมูลแท่งเทียน: 5m สำหรับ signal, 1h สำหรับ trend filter ---
+    candles_5m = fetch_candles(SYMBOL, "5", lookback_bars=200)
+    if not candles_5m:
+        log("[ERROR] No 5m candles fetched, skip this round")
         return
 
-    last_close = candles[-1]["close"]
+    candles_1h = fetch_candles(SYMBOL, HTF_RESOLUTION, lookback_bars=HTF_LOOKBACK_BARS)
+    if not candles_1h:
+        log("[ERROR] No higher timeframe candles fetched, skip this round")
+        return
+
+    last_close = candles_5m[-1]["close"]
+    if last_close <= 0:
+        log(f"[ERROR] Invalid last_close price: {last_close}, skip this round")
+        return
+
     log(f"[PRICE] {SYMBOL} last close (5m) = {last_close:.4f}")
 
-    macd_sig = macd_signal_from_candles(candles)
-    sig = macd_sig.get("signal", "HOLD")
+    # ------------------------------------------------------------
+    # 1) RISK MANAGEMENT: เช็ค SL / TP ถ้ามี position LONG อยู่
+    # ------------------------------------------------------------
+    if side == "LONG" and qty_pos > 0 and entry_price > 0:
+        sl_price = entry_price * (1.0 - SL_PCT)
+        tp_price = entry_price * (1.0 + TP_PCT)
+
+        # STOP-LOSS
+        if last_close <= sl_price:
+            price = round(last_close * (1 - SLIPPAGE_BPS / 10000), PRICE_ROUND)
+            log(
+                f"[SELL] STOP-LOSS triggered: entry={entry_price:.4f}, "
+                f"sl={sl_price:.4f}, last={last_close:.4f}, qty={qty_pos}"
+            )
+            res = place_ask(SYMBOL, qty_pos, price, DRY_RUN)
+            log(f"[SELL] STOP-LOSS result: {res}")
+
+            now_sec = now_server_ms() // 1000
+            pos["side"] = "FLAT"
+            pos["entry_price"] = 0.0
+            pos["qty"] = 0.0
+            pos["last_trade_ts"] = now_sec
+            save_pos(pos)
+            return  # ปิดรอบนี้เลย
+
+        # TAKE-PROFIT
+        if last_close >= tp_price:
+            price = round(last_close * (1 - SLIPPAGE_BPS / 10000), PRICE_ROUND)
+            log(
+                f"[SELL] TAKE-PROFIT triggered: entry={entry_price:.4f}, "
+                f"tp={tp_price:.4f}, last={last_close:.4f}, qty={qty_pos}"
+            )
+            res = place_ask(SYMBOL, qty_pos, price, DRY_RUN)
+            log(f"[SELL] TAKE-PROFIT result: {res}")
+
+            now_sec = now_server_ms() // 1000
+            pos["side"] = "FLAT"
+            pos["entry_price"] = 0.0
+            pos["qty"] = 0.0
+            pos["last_trade_ts"] = now_sec
+            save_pos(pos)
+            return  # ปิดรอบนี้เลย
+
+    # ------------------------------------------------------------
+    # 2) SIGNAL หลัก: MACD 5m
+    # ------------------------------------------------------------
+    macd_5m = macd_signal_from_candles(candles_5m, label="5m")
+    sig = macd_5m.get("signal", "HOLD")
 
     if sig == "HOLD":
-        log("[HOLD] No MACD cross signal")
+        log("[HOLD] No MACD cross signal on 5m")
         return
 
-    if not can_trade_after_cooldown(pos):
-        return
+    # ------------------------------------------------------------
+    # 3) TREND FILTER: MACD TF ใหญ่ (1h)
+    # ------------------------------------------------------------
+    htf_info = htf_trend_from_macd(candles_1h)
+    trend = htf_info.get("trend", "NEUTRAL")
 
-    # ใช้ราคา close แท่งล่าสุด + slippage เล็กน้อย
+    # ------------------------------------------------------------
+    # 4) BUY LOGIC
+    # - ต้องมีสัญญาณ BUY จาก MACD 5m
+    # - และ TF ใหญ่เป็น BULL เท่านั้น
+    # - และผ่าน cooldown ก่อน
+    # ------------------------------------------------------------
     if sig == "BUY":
         if side == "LONG":
             log("[SKIP] Already LONG, skip BUY")
+            return
+
+        if trend != "BULL":
+            log(f"[SKIP] 5m BUY but HTF trend={trend}, skip entry")
+            return
+
+        # cooldown ใช้เฉพาะตอน "เปิด position ใหม่"
+        if not can_trade_after_cooldown(pos):
             return
 
         price = round(last_close * (1 + SLIPPAGE_BPS / 10000), PRICE_ROUND)
@@ -469,16 +602,19 @@ def decide_and_trade_macd():
         save_pos(pos)
         return
 
+    # ------------------------------------------------------------
+    # 5) SELL LOGIC (ปิด LONG ด้วย MACD SELL 5m)
+    # - ตรงนี้ "ไม่ใช้ cooldown" เพราะเป็นจุด exit เพื่อลดความเสี่ยง
+    # ------------------------------------------------------------
     if sig == "SELL":
-        if side != "LONG" or pos.get("qty", 0) <= 0:
+        if side != "LONG" or qty_pos <= 0:
             log("[SKIP] No LONG position to close, skip SELL")
             return
 
-        qty = pos["qty"]
         price = round(last_close * (1 - SLIPPAGE_BPS / 10000), PRICE_ROUND)
 
-        log(f"[SELL] Signal=SELL qty={qty} @ {price} THB (dry_run={DRY_RUN})")
-        res = place_ask(SYMBOL, qty, price, DRY_RUN)
+        log(f"[SELL] Signal=SELL (5m MACD) qty={qty_pos} @ {price} THB (dry_run={DRY_RUN})")
+        res = place_ask(SYMBOL, qty_pos, price, DRY_RUN)
         log(f"[SELL] result: {res}")
 
         now_sec = now_server_ms() // 1000
