@@ -32,9 +32,9 @@ API_SECRET = (os.getenv("BITKUB_API_SECRET", "") or "").encode()
 
 SYMBOL = "XRP_THB"          # ใช้คู่เทรดสำหรับส่งออเดอร์
 
-REFRESH_SEC = 60            # วินาทีต่อการวนลูป 1 รอบ
+REFRESH_SEC = 60            # วินาทีต่อการวนลูป 1 รอบ (จะเช็กทุก 1 นาทีด้วยแท่ง 1H)
 ORDER_NOTIONAL_THB = 100    # ขนาดออเดอร์ต่อไม้ (THB)
-SLIPPAGE_BPS = 6            # slippage (bps) สำหรับตั้ง bid/ask ให้ match ง่ายขึ้น
+SLIPPAGE_BPS = 0            # slippage (bps) สำหรับตั้ง bid/ask ให้ match ง่ายขึ้น
 FEE_RATE = 0.0025           # 0.25% ต่อข้าง
 
 DRY_RUN = True              # True = ทดสอบ, False = ยิง order จริง
@@ -43,9 +43,14 @@ PRICE_ROUND = 2
 QTY_ROUND = 6
 
 TIME_SYNC_INTERVAL = 300    # วินาทีในการ resync server time
-COOLDOWN_SEC = 300          # วินาที cooldown หลังเทรด (เช่น 300 = 5 นาที)
+COOLDOWN_SEC = 300          # วินาที cooldown หลัง "เข้าไม้" (ใช้กับ BUY เท่านั้น)
 
 POS_FILE = "Cost.json"      # ไฟล์เก็บสถานะ position
+
+# --- Take Profit / Stop Loss ---
+ENABLE_TP_SL = True         # เปิด/ปิด TP/SL
+TP_PCT = 0.01               # TP +1% จากราคาเข้า
+SL_PCT = 0.02               # SL -2% จากราคาเข้า
 
 # Debug/Networking
 DEBUG_HTTP = False
@@ -308,19 +313,22 @@ def save_pos(pos: Dict[str, Any]):
 
 
 # ------------------------------------------------------------
-# [7] OHLCV (5m candles) VIA tradingview/history
+# [7] OHLCV (1h candles) VIA tradingview/history
 # ------------------------------------------------------------
-FIVE_MIN_SEC = 5 * 60
+ONE_HR_SEC = 60 * 60
 
 
-def fetch_5m_candles(sym: str, lookback_bars: int = 200) -> List[Dict[str, Any]]:
+def fetch_1h_candles(sym: str, lookback_bars: int = 200) -> List[Dict[str, Any]]:
+    """
+    ดึงแท่งเทียน 1 ชั่วโมงย้อนหลัง lookback_bars แท่ง จาก tradingview/history
+    """
     now_sec = now_server_ms() // 1000
-    frm = now_sec - lookback_bars * FIVE_MIN_SEC - FIVE_MIN_SEC
+    frm = now_sec - lookback_bars * ONE_HR_SEC - ONE_HR_SEC
 
     url = f"{BASE_URL}/tradingview/history"
     params = {
-        "symbol": sym,        # เช่น "XRP_THB"
-        "resolution": "5",    # 5 นาที
+        "symbol": sym,       # เช่น "XRP_THB"
+        "resolution": "60",  # 60 นาที (1 ชั่วโมง)
         "from": frm,
         "to": now_sec
     }
@@ -330,7 +338,7 @@ def fetch_5m_candles(sym: str, lookback_bars: int = 200) -> List[Dict[str, Any]]
 
     # ปกติจะเป็น: { "s":"ok", "t":[...], "o":[...], "h":[...], "l":[...], "c":[...], "v":[...] }
     if not isinstance(data, dict) or data.get("s") != "ok":
-        log(f"[ERROR] fetch_5m_candles unexpected payload: {data}")
+        log(f"[ERROR] fetch_1h_candles unexpected payload: {data}")
         return []
 
     ts_list = data.get("t", [])
@@ -356,9 +364,10 @@ def fetch_5m_candles(sym: str, lookback_bars: int = 200) -> List[Dict[str, Any]]
 
 
 # ------------------------------------------------------------
-# [8] MACD ด้วย pandas-ta
+# [8] MACD ด้วย pandas-ta (เพิ่ม hist_prev)
 # ------------------------------------------------------------
 def macd_signal_from_candles(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # ถ้าแท่งไม่พอ ก็ยังไม่เทรด
     if len(candles) < 50:
         return {"signal": "HOLD"}
 
@@ -372,9 +381,17 @@ def macd_signal_from_candles(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     df = pd.concat([df, macd_df], axis=1)
 
-    col_macd = macd_df.columns[0]      # เช่น MACD_12_26_9
-    col_signal = macd_df.columns[1]    # เช่น MACDs_12_26_9
-    col_hist = macd_df.columns[2]      # เช่น MACDh_12_26_9
+    try:
+        col_macd   = "MACD_12_26_9"
+        col_hist   = "MACDh_12_26_9"
+        col_signal = "MACDs_12_26_9"
+        _ = macd_df[[col_macd, col_hist, col_signal]]
+    except KeyError:
+        # fallback เผื่อเวอร์ชัน pandas_ta ใช้ชื่ออื่น
+        cols = list(macd_df.columns)
+        col_macd = [c for c in cols if "MACD_" in c and "MACDh" not in c and "MACDs" not in c][0]
+        col_hist = [c for c in cols if "MACDh" in c][0]
+        col_signal = [c for c in cols if "MACDs" in c or c.endswith("signal")][0]
 
     df_valid = df.dropna(subset=[col_macd, col_signal, col_hist])
     if len(df_valid) < 2:
@@ -383,29 +400,35 @@ def macd_signal_from_candles(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
     prev_row = df_valid.iloc[-2]
     last_row = df_valid.iloc[-1]
 
-    macd_prev, macd_now = prev_row[col_macd], last_row[col_macd]
-    sig_prev, sig_now = prev_row[col_signal], last_row[col_signal]
-    hist_now = last_row[col_hist]
+    macd_prev = prev_row[col_macd]
+    sig_prev  = prev_row[col_signal]
+    macd_now  = last_row[col_macd]
+    sig_now   = last_row[col_signal]
+    hist_prev = prev_row[col_hist]
+    hist_now  = last_row[col_hist]
 
     bullish_cross = macd_prev < sig_prev and macd_now > sig_now
     bearish_cross = macd_prev > sig_prev and macd_now < sig_now
 
-    if bullish_cross and hist_now > 0:
+    if bullish_cross:
         sig = "BUY"
-    elif bearish_cross and hist_now < 0:
+    elif bearish_cross:
         sig = "SELL"
     else:
         sig = "HOLD"
 
     log(
-        f"[MACD] macd_now={macd_now:.6f} signal_now={sig_now:.6f} "
-        f"hist={hist_now:.6f} -> {sig}"
+        f"[MACD] macd_prev={macd_prev:.6f}, sig_prev={sig_prev:.6f} | "
+        f"macd_now={macd_now:.6f}, sig_now={sig_now:.6f}, "
+        f"hist_prev={hist_prev:.6f}, hist_now={hist_now:.6f} -> {sig}"
     )
+
     return {
         "signal": sig,
         "macd": float(macd_now),
         "signal_line": float(sig_now),
         "hist": float(hist_now),
+        "hist_prev": float(hist_prev),
     }
 
 
@@ -423,40 +446,139 @@ def can_trade_after_cooldown(pos: Dict[str, Any]) -> bool:
 
 
 # ------------------------------------------------------------
-# [10] EXECUTE STRATEGY (MACD 5m) - ใช้เฉพาะราคา close
+# [10] TP/SL CHECK (ขายทันทีเมื่อถึงจุด)
+# ------------------------------------------------------------
+def check_tp_sl_exit(pos: Dict[str, Any], last_close: float) -> bool:
+    """
+    เช็กว่าเข้าเงื่อนไข TP หรือ SL หรือไม่
+    ถ้าใช่จะยิง SELL ทันที และ return True
+    ถ้าไม่ใช่ return False
+    """
+    if pos.get("side") != "LONG" or pos.get("qty", 0) <= 0:
+        return False
+
+    entry = pos.get("entry_price", 0.0)
+    if entry <= 0:
+        return False
+
+    tp_price = entry * (1 + TP_PCT)
+    sl_price = entry * (1 - SL_PCT)
+
+    reason = None
+    if last_close >= tp_price:
+        reason = "TP"
+    elif last_close <= sl_price:
+        reason = "SL"
+
+    if not reason:
+        return False
+
+    qty = pos["qty"]
+    price = round(last_close * (1 - SLIPPAGE_BPS / 10000), PRICE_ROUND)
+
+    log(
+        f"[SELL] {reason} hit: last_close={last_close:.4f}, "
+        f"entry={entry:.4f}, tp={tp_price:.4f}, sl={sl_price:.4f}, "
+        f"qty={qty} @ {price} THB (dry_run={DRY_RUN})"
+    )
+
+    res = place_ask(SYMBOL, qty, price, DRY_RUN)
+    log(f"[SELL] result: {res}")
+
+    now_sec = now_server_ms() // 1000
+    pos["side"] = "FLAT"
+    pos["entry_price"] = 0.0
+    pos["qty"] = 0.0
+    pos["last_trade_ts"] = now_sec
+    save_pos(pos)
+
+    return True
+
+
+# ------------------------------------------------------------
+# [11] EXECUTE STRATEGY (MACD 1h + EMA50 FILTER)
 # ------------------------------------------------------------
 def decide_and_trade_macd():
     pos = load_pos()
     side = pos.get("side", "FLAT")
 
-    candles = fetch_5m_candles(SYMBOL, lookback_bars=200)
+    candles = fetch_1h_candles(SYMBOL, lookback_bars=200)
     if not candles:
         log("[ERROR] No candles fetched, skip this round")
         return
 
     last_close = candles[-1]["close"]
-    log(f"[PRICE] {SYMBOL} last close (5m) = {last_close:.4f}")
+    log(f"[PRICE] {SYMBOL} last close (1h) = {last_close:.4f}")
 
+    # 1) เช็ก TP/SL ก่อน ถ้าถึงเป้าก็ขายเลยและจบรอบ
+    if ENABLE_TP_SL:
+        if check_tp_sl_exit(pos, last_close):
+            return
+
+    # 2) สัญญาณ MACD (crossover + histogram)
     macd_sig = macd_signal_from_candles(candles)
     sig = macd_sig.get("signal", "HOLD")
+    hist_now = macd_sig.get("hist")
+    hist_prev = macd_sig.get("hist_prev")
 
     if sig == "HOLD":
         log("[HOLD] No MACD cross signal")
         return
 
-    if not can_trade_after_cooldown(pos):
+    # 3) คำนวณ EMA50 จากราคาปิด
+    df = pd.DataFrame(candles)
+    df["dt"] = pd.to_datetime(df["ts"], unit="s")
+    df.set_index("dt", inplace=True)
+
+    ema50_series = ta.ema(df["close"], length=50)
+    ema50_series = ema50_series.dropna()
+    if ema50_series.empty:
+        log("[SKIP] EMA50 not ready yet")
         return
 
-    # ใช้ราคา close แท่งล่าสุด + slippage เล็กน้อย
+    ema50 = float(ema50_series.iloc[-1])
+
+    log(
+        f"[MACD DBG] sig={sig}, macd={macd_sig.get('macd')}, "
+        f"signal_line={macd_sig.get('signal_line')}, "
+        f"hist_now={hist_now}, hist_prev={hist_prev}, ema50={ema50}"
+    )
+
+    # --- BUY ตาม MACD cross ขึ้น + EMA50 + Histogram filter ---
     if sig == "BUY":
         if side == "LONG":
             log("[SKIP] Already LONG, skip BUY")
             return
 
+        # ใช้ cooldown เฉพาะตอนเปิดไม้ใหม่
+        if not can_trade_after_cooldown(pos):
+            return
+
+        # 1) ราคา ต้องอยู่เหนือ EMA50
+        if last_close <= ema50:
+            log(
+                f"[SKIP] Price={last_close:.4f} <= EMA50={ema50:.4f} "
+                f"Trend ยังไม่เป็นขาขึ้น ชัดเจน"
+            )
+            return
+
+        # 2) Histogram ต้องเป็นบวก
+        if hist_now is None or hist_now <= 0:
+            log(f"[SKIP] Histogram ยังไม่เป็นบวก (hist_now={hist_now})")
+            return
+
+        # 3) Histogram ต้องกำลังเพิ่มขึ้น
+        if hist_prev is None or hist_now <= hist_prev:
+            log(
+                f"[SKIP] Histogram ไม่ได้เพิ่มขึ้น "
+                f"(hist_now={hist_now}, hist_prev={hist_prev})"
+            )
+            return
+
         price = round(last_close * (1 + SLIPPAGE_BPS / 10000), PRICE_ROUND)
         thb_amount = ORDER_NOTIONAL_THB
 
-        log(f"[BUY ] Signal=BUY @ {price} THB amount={thb_amount} (dry_run={DRY_RUN})")
+        log(f"[BUY ] Signal=BUY (EMA50+Hist OK) @ {price} THB amount={thb_amount} (dry_run={DRY_RUN})")
         res = place_bid(SYMBOL, thb_amount, price, DRY_RUN)
         log(f"[BUY ] result: {res}")
 
@@ -469,6 +591,7 @@ def decide_and_trade_macd():
         save_pos(pos)
         return
 
+    # --- SELL ตาม MACD cross ลง (ปิด LONG) ---
     if sig == "SELL":
         if side != "LONG" or pos.get("qty", 0) <= 0:
             log("[SKIP] No LONG position to close, skip SELL")
@@ -491,10 +614,10 @@ def decide_and_trade_macd():
 
 
 # ------------------------------------------------------------
-# [11] MAIN LOOP (MACD 5m BOT)
+# [12] MAIN LOOP (MACD 1h BOT)
 # ------------------------------------------------------------
 def run_macd_bot():
-    log(f"[INIT] Starting MACD 5m bot on {SYMBOL}, DRY_RUN={DRY_RUN}")
+    log(f"[INIT] Starting MACD 1h bot on {SYMBOL}, DRY_RUN={DRY_RUN}")
     sync_server_time()
 
     while True:
