@@ -12,7 +12,7 @@ pd.set_option('display.max_rows', None)
 
 BITKUB_TV_URL = "https://api.bitkub.com/tradingview/history"
 
-currency = ["XRP_THB", "BTC_THB", "ETH_THB", "USDT_THB", "KUB_THB", "ADA_THB", "BNB_THB"]
+currency = ["XRP_THB", "BTC_THB", "ETH_THB", "USDT_THB", "SOL_THB", "ADA_THB", "BNB_THB"]
 
 timeframes = {
     "1m": "1",

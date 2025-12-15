@@ -37,20 +37,24 @@ ORDER_NOTIONAL_THB = 100    # ขนาดออเดอร์ต่อไม�
 SLIPPAGE_BPS = 0            # slippage (bps) สำหรับตั้ง bid/ask ให้ match ง่ายขึ้น
 FEE_RATE = 0.0025           # 0.25% ต่อข้าง
 
-DRY_RUN = True              # True = ทดสอบ, False = ยิง order จริง
+DRY_RUN = False             # True = ทดสอบ, False = ยิง order จริง
 
 PRICE_ROUND = 2
 QTY_ROUND = 6
 
 TIME_SYNC_INTERVAL = 300    # วินาทีในการ resync server time
-COOLDOWN_SEC = 300          # วินาที cooldown หลัง "เข้าไม้" (ใช้กับ BUY เท่านั้น)
+COOLDOWN_SEC = 1800         # วินาที cooldown หลัง "เข้าไม้" (ใช้กับ BUY เท่านั้น)
 
 POS_FILE = "Cost.json"      # ไฟล์เก็บสถานะ position
 
-# --- Take Profit / Stop Loss ---
-ENABLE_TP_SL = True         # เปิด/ปิด TP/SL
-TP_PCT = 0.01               # TP +1% จากราคาเข้า
-SL_PCT = 0.02               # SL -2% จากราคาเข้า
+# --- EMA / ATR STRATEGY SETTINGS (จาก Pine Script) ---
+EMA_FAST_LEN = 5
+EMA_SLOW_LEN = 13
+ATR_LEN = 14
+ATR_MULT_SL = 0.5           # ระยะ SL ผูกกับ ATR
+RR_TARGET = 3.0             # ต้องการ R:R = 3:1 (Reward : Risk)
+
+CONFIRM_CANDLE = True       # เหมือน confirmCandle ใน Pine
 
 # Debug/Networking
 DEBUG_HTTP = False
@@ -147,8 +151,6 @@ def color_for(msg: str) -> str:
         return FG_BLUE + BOLD
     if msg.startswith("[HOLD]"):
         return FG_CYAN
-    if msg.startswith("[MACD]"):
-        return FG_BLUE
     if msg.startswith("[BUY "):
         return FG_GREEN + BOLD
     if msg.startswith("[SELL]"):
@@ -171,22 +173,19 @@ def log(msg: str):
 
 def sync_server_time():
     global _server_offset_ms, _last_sync_ts
-    url = f"{BASE_URL}/api/v3/servertime"
+    url = f"{BASE_URL}/api/servertime"
     try:
         r = http_get(url, timeout=8)
         data = r.json()
-        server_time = None
-        if isinstance(data, (int, float, str)):
+        # server time ของ Bitkub v1 จะคืนเป็น int ตรง ๆ หรืออยู่ใน "result"
+        if isinstance(data, dict) and "result" in data:
+            server_time = int(data["result"])
+        else:
             server_time = int(data)
-        elif isinstance(data, dict):
-            server_time = int(data.get("result") or data.get("server_time"))
-        if server_time is None:
-            log(f"[SYNC ERROR] unexpected payload: {data}")
-            return
         local_time = int(time.time() * 1000)
-        _server_offset_ms = server_time - local_time
+        _server_offset_ms = server_time * 1000 - local_time
         _last_sync_ts = time.time()
-        readable_time = datetime.datetime.fromtimestamp(server_time / 1000)
+        readable_time = datetime.datetime.fromtimestamp(server_time)
         log(f"[SYNC] offset={_server_offset_ms} ms, server={readable_time:%Y-%m-%d %H:%M:%S}")
     except Exception as e:
         log(f"[SYNC ERROR] {e}")
@@ -224,7 +223,7 @@ def build_headers(timestamp_ms: str, signature: Optional[str] = None) -> Dict[st
 # [5] PRIVATE TRADE API
 # ------------------------------------------------------------
 def place_bid(sym: str, thb_amount: float, rate: float, dry_run: bool) -> Dict[str, Any]:
-    method, path = "POST", "/api/v3/market/place-bid"
+    method, path = "POST", "/api/market/place-bid"
     ts = ts_ms_str()
     payload = {
         "sym": sym,
@@ -241,7 +240,7 @@ def place_bid(sym: str, thb_amount: float, rate: float, dry_run: bool) -> Dict[s
 
 
 def place_ask(sym: str, qty_coin: float, rate: float, dry_run: bool) -> Dict[str, Any]:
-    method, path = "POST", "/api/v3/market/place-ask"
+    method, path = "POST", "/api/market/place-ask"
     ts = ts_ms_str()
     payload = {
         "sym": sym,
@@ -258,49 +257,32 @@ def place_ask(sym: str, qty_coin: float, rate: float, dry_run: bool) -> Dict[str
 
 
 # ------------------------------------------------------------
-# [5.1] ACCOUNT — OPTIONAL HELPERS
-# ------------------------------------------------------------
-def market_wallet() -> Dict[str, Any]:
-    method, path = "POST", "/api/v3/market/wallet"
-    ts = ts_ms_str()
-    body = "{}"
-    sg = sign(ts, method, path, body)
-    r = http_post(BASE_URL + path, headers=build_headers(ts, sg), data=body, timeout=HTTP_TIMEOUT)
-    return r.json()
-
-
-def market_balances() -> Dict[str, Any]:
-    method, path = "POST", "/api/v3/market/balances"
-    ts = ts_ms_str()
-    body = "{}"
-    sg = sign(ts, method, path, body)
-    r = http_post(BASE_URL + path, headers=build_headers(ts, sg), data=body, timeout=HTTP_TIMEOUT)
-    return r.json()
-
-
-# ------------------------------------------------------------
 # [6] POSITION PERSISTENCE (Cost.json)
 # ------------------------------------------------------------
+def _default_pos() -> Dict[str, Any]:
+    return {
+        "side": "FLAT",        # "FLAT" หรือ "LONG"
+        "entry_price": 0.0,
+        "qty": 0.0,
+        "last_trade_ts": 0,
+        "stop_loss": 0.0,
+        "take_profit": 0.0,
+    }
+
+
 def load_pos() -> Dict[str, Any]:
     if not os.path.exists(POS_FILE):
-        return {
-            "side": "FLAT",
-            "entry_price": 0.0,
-            "qty": 0.0,
-            "last_trade_ts": 0
-        }
+        return _default_pos()
     try:
         with open(POS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+        defaults = _default_pos()
+        for k, v in defaults.items():
+            data.setdefault(k, v)
         return data
     except Exception as e:
         log(f"[POS ERROR] load_pos failed: {e}")
-        return {
-            "side": "FLAT",
-            "entry_price": 0.0,
-            "qty": 0.0,
-            "last_trade_ts": 0
-        }
+        return _default_pos()
 
 
 def save_pos(pos: Dict[str, Any]):
@@ -313,19 +295,20 @@ def save_pos(pos: Dict[str, Any]):
 
 
 # ------------------------------------------------------------
-# [7] OHLCV (1h candles) VIA tradingview/history
+# [7] OHLCV (1h candles) VIA Bitkub tradingview/history
 # ------------------------------------------------------------
 ONE_HR_SEC = 60 * 60
 
 
 def fetch_1h_candles(sym: str, lookback_bars: int = 200) -> List[Dict[str, Any]]:
     """
-    ดึงแท่งเทียน 1 ชั่วโมงย้อนหลัง lookback_bars แท่ง จาก tradingview/history
+    ดึงแท่งเทียน 1 ชั่วโมงย้อนหลัง lookback_bars แท่ง
+    จาก Bitkub public endpoint: GET /tradingview/history
     """
     now_sec = now_server_ms() // 1000
     frm = now_sec - lookback_bars * ONE_HR_SEC - ONE_HR_SEC
 
-    url = f"{BASE_URL}/tradingview/history"
+    url = f"{BASE_URL}/tradingview/history"  # Bitkub API (Non-secure)
     params = {
         "symbol": sym,       # เช่น "XRP_THB"
         "resolution": "60",  # 60 นาที (1 ชั่วโมง)
@@ -364,76 +347,7 @@ def fetch_1h_candles(sym: str, lookback_bars: int = 200) -> List[Dict[str, Any]]
 
 
 # ------------------------------------------------------------
-# [8] MACD ด้วย pandas-ta (เพิ่ม hist_prev)
-# ------------------------------------------------------------
-def macd_signal_from_candles(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # ถ้าแท่งไม่พอ ก็ยังไม่เทรด
-    if len(candles) < 50:
-        return {"signal": "HOLD"}
-
-    df = pd.DataFrame(candles)
-    df["dt"] = pd.to_datetime(df["ts"], unit="s")
-    df.set_index("dt", inplace=True)
-
-    macd_df = ta.macd(df["close"], fast=12, slow=26, signal=9)
-    if macd_df is None or macd_df.empty:
-        return {"signal": "HOLD"}
-
-    df = pd.concat([df, macd_df], axis=1)
-
-    try:
-        col_macd   = "MACD_12_26_9"
-        col_hist   = "MACDh_12_26_9"
-        col_signal = "MACDs_12_26_9"
-        _ = macd_df[[col_macd, col_hist, col_signal]]
-    except KeyError:
-        # fallback เผื่อเวอร์ชัน pandas_ta ใช้ชื่ออื่น
-        cols = list(macd_df.columns)
-        col_macd = [c for c in cols if "MACD_" in c and "MACDh" not in c and "MACDs" not in c][0]
-        col_hist = [c for c in cols if "MACDh" in c][0]
-        col_signal = [c for c in cols if "MACDs" in c or c.endswith("signal")][0]
-
-    df_valid = df.dropna(subset=[col_macd, col_signal, col_hist])
-    if len(df_valid) < 2:
-        return {"signal": "HOLD"}
-
-    prev_row = df_valid.iloc[-2]
-    last_row = df_valid.iloc[-1]
-
-    macd_prev = prev_row[col_macd]
-    sig_prev  = prev_row[col_signal]
-    macd_now  = last_row[col_macd]
-    sig_now   = last_row[col_signal]
-    hist_prev = prev_row[col_hist]
-    hist_now  = last_row[col_hist]
-
-    bullish_cross = macd_prev < sig_prev and macd_now > sig_now
-    bearish_cross = macd_prev > sig_prev and macd_now < sig_now
-
-    if bullish_cross:
-        sig = "BUY"
-    elif bearish_cross:
-        sig = "SELL"
-    else:
-        sig = "HOLD"
-
-    log(
-        f"[MACD] macd_prev={macd_prev:.6f}, sig_prev={sig_prev:.6f} | "
-        f"macd_now={macd_now:.6f}, sig_now={sig_now:.6f}, "
-        f"hist_prev={hist_prev:.6f}, hist_now={hist_now:.6f} -> {sig}"
-    )
-
-    return {
-        "signal": sig,
-        "macd": float(macd_now),
-        "signal_line": float(sig_now),
-        "hist": float(hist_now),
-        "hist_prev": float(hist_prev),
-    }
-
-
-# ------------------------------------------------------------
-# [9] COOLDOWN CHECK
+# [8] COOLDOWN CHECK
 # ------------------------------------------------------------
 def can_trade_after_cooldown(pos: Dict[str, Any]) -> bool:
     last_ts = pos.get("last_trade_ts", 0)
@@ -446,161 +360,116 @@ def can_trade_after_cooldown(pos: Dict[str, Any]) -> bool:
 
 
 # ------------------------------------------------------------
-# [10] TP/SL CHECK (ขายทันทีเมื่อถึงจุด)
+# [9] STRATEGY: EMA + ATR + TP (R:R = 3:1, LONG ONLY)
 # ------------------------------------------------------------
-def check_tp_sl_exit(pos: Dict[str, Any], last_close: float) -> bool:
+def decide_and_trade_ema_atr():
     """
-    เช็กว่าเข้าเงื่อนไข TP หรือ SL หรือไม่
-    ถ้าใช่จะยิง SELL ทันที และ return True
-    ถ้าไม่ใช่ return False
+    Logic จาก Pine EMA+ATR:
+    - bullTrend = emaFast > emaSlow
+    - trendChange = bullTrend != bullTrend[1]
+    - buy/sell signal ตาม confirmCandle
+    - SL ใช้ ATR, TP คิดจาก R:R = 3:1
     """
-    if pos.get("side") != "LONG" or pos.get("qty", 0) <= 0:
-        return False
-
-    entry = pos.get("entry_price", 0.0)
-    if entry <= 0:
-        return False
-
-    tp_price = entry * (1 + TP_PCT)
-    sl_price = entry * (1 - SL_PCT)
-
-    reason = None
-    if last_close >= tp_price:
-        reason = "TP"
-    elif last_close <= sl_price:
-        reason = "SL"
-
-    if not reason:
-        return False
-
-    qty = pos["qty"]
-    price = round(last_close * (1 - SLIPPAGE_BPS / 10000), PRICE_ROUND)
-
-    log(
-        f"[SELL] {reason} hit: last_close={last_close:.4f}, "
-        f"entry={entry:.4f}, tp={tp_price:.4f}, sl={sl_price:.4f}, "
-        f"qty={qty} @ {price} THB (dry_run={DRY_RUN})"
-    )
-
-    res = place_ask(SYMBOL, qty, price, DRY_RUN)
-    log(f"[SELL] result: {res}")
-
-    now_sec = now_server_ms() // 1000
-    pos["side"] = "FLAT"
-    pos["entry_price"] = 0.0
-    pos["qty"] = 0.0
-    pos["last_trade_ts"] = now_sec
-    save_pos(pos)
-
-    return True
-
-
-# ------------------------------------------------------------
-# [11] EXECUTE STRATEGY (MACD 1h + EMA50 FILTER)
-# ------------------------------------------------------------
-def decide_and_trade_macd():
     pos = load_pos()
     side = pos.get("side", "FLAT")
 
     candles = fetch_1h_candles(SYMBOL, lookback_bars=200)
-    if not candles:
-        log("[ERROR] No candles fetched, skip this round")
+    if len(candles) < 50:
+        log("[SKIP] Not enough candles for EMA/ATR")
         return
 
-    last_close = candles[-1]["close"]
-    log(f"[PRICE] {SYMBOL} last close (1h) = {last_close:.4f}")
-
-    # 1) เช็ก TP/SL ก่อน ถ้าถึงเป้าก็ขายเลยและจบรอบ
-    if ENABLE_TP_SL:
-        if check_tp_sl_exit(pos, last_close):
-            return
-
-    # 2) สัญญาณ MACD (crossover + histogram)
-    macd_sig = macd_signal_from_candles(candles)
-    sig = macd_sig.get("signal", "HOLD")
-    hist_now = macd_sig.get("hist")
-    hist_prev = macd_sig.get("hist_prev")
-
-    if sig == "HOLD":
-        log("[HOLD] No MACD cross signal")
-        return
-
-    # 3) คำนวณ EMA50 จากราคาปิด
     df = pd.DataFrame(candles)
     df["dt"] = pd.to_datetime(df["ts"], unit="s")
     df.set_index("dt", inplace=True)
 
-    ema50_series = ta.ema(df["close"], length=50)
-    ema50_series = ema50_series.dropna()
-    if ema50_series.empty:
-        log("[SKIP] EMA50 not ready yet")
+    # คำนวณ EMA และ ATR
+    df["ema_fast"] = ta.ema(df["close"], length=EMA_FAST_LEN)
+    df["ema_slow"] = ta.ema(df["close"], length=EMA_SLOW_LEN)
+    df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=ATR_LEN)
+
+    df_valid = df.dropna(subset=["ema_fast", "ema_slow", "atr"])
+    if len(df_valid) < 2:
+        log("[SKIP] EMA/ATR not ready yet")
         return
 
-    ema50 = float(ema50_series.iloc[-1])
+    prev_row = df_valid.iloc[-2]
+    last_row = df_valid.iloc[-1]
+
+    last_close = float(last_row["close"])
+    last_open  = float(last_row["open"])
+    last_high  = float(last_row["high"])
+    last_low   = float(last_row["low"])
+    atr_now    = float(last_row["atr"])
+
+    log(f"[PRICE] {SYMBOL} last close (1h) = {last_close:.4f}")
+
+    # --------- 1) CHECK TP / SL EXIT (LONG ONLY) ----------
+    if side == "LONG" and pos.get("qty", 0) > 0:
+        sl = float(pos.get("stop_loss", 0.0) or 0.0)
+        tp = float(pos.get("take_profit", 0.0) or 0.0)
+        exit_reason = None
+
+        if tp > 0 and last_high >= tp:
+            exit_reason = "TP"
+        elif sl > 0 and last_low <= sl:
+            exit_reason = "SL"
+
+        if exit_reason:
+            qty = pos["qty"]
+            price = round(last_close * (1 - SLIPPAGE_BPS / 10000), PRICE_ROUND)
+            log(
+                f"[SELL] {exit_reason} hit: last_close={last_close:.4f}, "
+                f"entry={pos.get('entry_price', 0.0):.4f}, tp={tp:.4f}, sl={sl:.4f}, "
+                f"qty={qty} @ {price} THB (dry_run={DRY_RUN})"
+            )
+            res = place_ask(SYMBOL, qty, price, DRY_RUN)
+            log(f"[SELL] result: {res}")
+
+            now_sec = now_server_ms() // 1000
+            pos["side"] = "FLAT"
+            pos["entry_price"] = 0.0
+            pos["qty"] = 0.0
+            pos["last_trade_ts"] = now_sec
+            pos["stop_loss"] = 0.0
+            pos["take_profit"] = 0.0
+            save_pos(pos)
+            return
+
+    # --------- 2) BUILD SIGNALS จาก EMA/ATR LOGIC ----------
+    bull_trend_now  = last_row["ema_fast"] > last_row["ema_slow"]
+    bull_trend_prev = prev_row["ema_fast"] > prev_row["ema_slow"]
+    bear_trend_now  = last_row["ema_fast"] < last_row["ema_slow"]
+    bear_trend_prev = prev_row["ema_fast"] < prev_row["ema_slow"]
+
+    trend_change = bull_trend_now != bull_trend_prev
+
+    buyCondition1 = bull_trend_now and trend_change and (last_close > last_open)
+    sellCondition1 = bear_trend_now and trend_change and (last_close < last_open)
+    buyCondition2 = bull_trend_now and trend_change
+    sellCondition2 = bear_trend_now and trend_change
+
+    if CONFIRM_CANDLE:
+        buySignal = buyCondition1
+        sellSignal = sellCondition1
+    else:
+        buySignal = buyCondition2
+        sellSignal = sellCondition2
 
     log(
-        f"[MACD DBG] sig={sig}, macd={macd_sig.get('macd')}, "
-        f"signal_line={macd_sig.get('signal_line')}, "
-        f"hist_now={hist_now}, hist_prev={hist_prev}, ema50={ema50}"
+        f"[EMA ATR DBG] ema_fast={last_row['ema_fast']:.4f}, "
+        f"ema_slow={last_row['ema_slow']:.4f}, atr={atr_now:.4f}, "
+        f"bull_now={bull_trend_now}, bull_prev={bull_trend_prev}, "
+        f"trend_change={trend_change}, buySignal={buySignal}, sellSignal={sellSignal}"
     )
 
-    # --- BUY ตาม MACD cross ขึ้น + EMA50 + Histogram filter ---
-    if sig == "BUY":
-        if side == "LONG":
-            log("[SKIP] Already LONG, skip BUY")
-            return
-
-        # ใช้ cooldown เฉพาะตอนเปิดไม้ใหม่
-        if not can_trade_after_cooldown(pos):
-            return
-
-        # 1) ราคา ต้องอยู่เหนือ EMA50
-        if last_close <= ema50:
-            log(
-                f"[SKIP] Price={last_close:.4f} <= EMA50={ema50:.4f} "
-                f"Trend ยังไม่เป็นขาขึ้น ชัดเจน"
-            )
-            return
-
-        # 2) Histogram ต้องเป็นบวก
-        if hist_now is None or hist_now <= 0:
-            log(f"[SKIP] Histogram ยังไม่เป็นบวก (hist_now={hist_now})")
-            return
-
-        # 3) Histogram ต้องกำลังเพิ่มขึ้น
-        if hist_prev is None or hist_now <= hist_prev:
-            log(
-                f"[SKIP] Histogram ไม่ได้เพิ่มขึ้น "
-                f"(hist_now={hist_now}, hist_prev={hist_prev})"
-            )
-            return
-
-        price = round(last_close * (1 + SLIPPAGE_BPS / 10000), PRICE_ROUND)
-        thb_amount = ORDER_NOTIONAL_THB
-
-        log(f"[BUY ] Signal=BUY (EMA50+Hist OK) @ {price} THB amount={thb_amount} (dry_run={DRY_RUN})")
-        res = place_bid(SYMBOL, thb_amount, price, DRY_RUN)
-        log(f"[BUY ] result: {res}")
-
-        now_sec = now_server_ms() // 1000
-        pos["side"] = "LONG"
-        pos["entry_price"] = price
-        qty = (thb_amount / price) * (1.0 - FEE_RATE)
-        pos["qty"] = qty
-        pos["last_trade_ts"] = now_sec
-        save_pos(pos)
-        return
-
-    # --- SELL ตาม MACD cross ลง (ปิด LONG) ---
-    if sig == "SELL":
-        if side != "LONG" or pos.get("qty", 0) <= 0:
-            log("[SKIP] No LONG position to close, skip SELL")
-            return
-
+    # --------- 3) INVALIDATION: SELL เมื่อมี sellSignal ----------
+    if sellSignal and side == "LONG" and pos.get("qty", 0) > 0:
         qty = pos["qty"]
         price = round(last_close * (1 - SLIPPAGE_BPS / 10000), PRICE_ROUND)
-
-        log(f"[SELL] Signal=SELL qty={qty} @ {price} THB (dry_run={DRY_RUN})")
+        log(
+            f"[SELL] Invalidation by sellSignal: "
+            f"qty={qty} @ {price} THB (dry_run={DRY_RUN})"
+        )
         res = place_ask(SYMBOL, qty, price, DRY_RUN)
         log(f"[SELL] result: {res}")
 
@@ -609,24 +478,81 @@ def decide_and_trade_macd():
         pos["entry_price"] = 0.0
         pos["qty"] = 0.0
         pos["last_trade_ts"] = now_sec
+        pos["stop_loss"] = 0.0
+        pos["take_profit"] = 0.0
         save_pos(pos)
         return
 
+    # --------- 4) NEW LONG ENTRY เมื่อมี buySignal ----------
+    if buySignal:
+        if side == "LONG" and pos.get("qty", 0) > 0:
+            log("[SKIP] Already LONG, skip new BUY")
+            return
+
+        if not can_trade_after_cooldown(pos):
+            return
+
+        entry_price = last_close
+        stop_loss = last_low - atr_now * ATR_MULT_SL
+        risk = entry_price - stop_loss
+
+        if risk <= 0:
+            log(
+                f"[SKIP] Invalid risk (entry={entry_price:.4f}, "
+                f"stop_loss={stop_loss:.4f})"
+            )
+            return
+
+        # TP จาก Risk:Reward = RR_TARGET (เช่น 3:1)
+        take_profit = entry_price + risk * RR_TARGET
+
+        thb_amount = ORDER_NOTIONAL_THB
+        price_for_order = round(entry_price * (1 + SLIPPAGE_BPS / 10000), PRICE_ROUND)
+
+        log(
+            f"[BUY ] Signal=BUY (EMA/ATR) entry={entry_price:.4f}, "
+            f"sl={stop_loss:.4f}, tp(RR={RR_TARGET:.1f})={take_profit:.4f}, "
+            f"risk={risk:.4f}, "
+            f"amt={thb_amount} THB @ {price_for_order} (dry_run={DRY_RUN})"
+        )
+
+        res = place_bid(SYMBOL, thb_amount, price_for_order, DRY_RUN)
+        log(f"[BUY ] result: {res}")
+
+        now_sec = now_server_ms() // 1000
+        qty = (thb_amount / entry_price) * (1.0 - FEE_RATE)
+
+        pos["side"] = "LONG"
+        pos["entry_price"] = entry_price
+        pos["qty"] = qty
+        pos["last_trade_ts"] = now_sec
+        pos["stop_loss"] = stop_loss
+        pos["take_profit"] = take_profit
+        save_pos(pos)
+        return
+
+    # --------- 5) ไม่มีสัญญาณ ----------
+    log("[HOLD] No trading signal from EMA/ATR")
+    return
+
 
 # ------------------------------------------------------------
-# [12] MAIN LOOP (MACD 1h BOT)
+# [10] MAIN LOOP (EMA+ATR 1h BOT)
 # ------------------------------------------------------------
-def run_macd_bot():
-    log(f"[INIT] Starting MACD 1h bot on {SYMBOL}, DRY_RUN={DRY_RUN}")
+def run_ema_atr_bot():
+    log(
+        f"[INIT] Starting EMA+ATR 1h bot on {SYMBOL}, "
+        f"DRY_RUN={DRY_RUN}, RR={RR_TARGET:.1f}:1"
+    )
     sync_server_time()
 
     while True:
         try:
-            decide_and_trade_macd()
+            decide_and_trade_ema_atr()
         except Exception as e:
             log(f"[ERROR] Exception in main loop: {e}")
         time.sleep(REFRESH_SEC)
 
 
 if __name__ == "__main__":
-    run_macd_bot()
+    run_ema_atr_bot()
